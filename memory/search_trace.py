@@ -45,7 +45,7 @@ class LinkInfo(BaseModel):
     """Information about a link to a neighbor."""
     to_node_id: str = Field(description="Target node ID")
     link_type: Literal["temporal", "semantic", "entity"] = Field(description="Type of link")
-    link_weight: float = Field(description="Weight of the link", ge=0.0, le=1.0)
+    link_weight: float = Field(description="Weight of the link (can exceed 1.0 when aggregating multiple connections)", ge=0.0)
     entity_id: Optional[str] = Field(default=None, description="Entity ID if link_type is 'entity'")
     new_activation: Optional[float] = Field(default=None, description="Activation that would be passed to neighbor (None for supplementary links)")
     followed: bool = Field(description="Whether this link was followed (or pruned)")

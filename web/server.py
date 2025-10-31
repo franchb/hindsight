@@ -14,7 +14,8 @@ from dotenv import load_dotenv
 import os
 import sys
 from pathlib import Path
-from typing import Optional
+from typing import Optional, List, Dict, Any
+from datetime import datetime
 
 # Add parent directory to path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -38,6 +39,23 @@ class SearchRequest(BaseModel):
     thinking_budget: int = 100
     top_k: int = 10
     mmr_lambda: float = 0.5
+    trace: bool = False
+
+
+class MemoryItem(BaseModel):
+    """Single memory item for batch put."""
+    content: str
+    event_date: Optional[datetime] = None
+    context: Optional[str] = None
+
+
+class BatchPutRequest(BaseModel):
+    """Request model for batch put endpoint."""
+    agent_id: str
+    items: List[MemoryItem]
+    document_id: Optional[str] = None
+    document_metadata: Optional[Dict[str, Any]] = None
+    upsert: bool = False
 
 
 async def get_graph_data():
@@ -179,6 +197,7 @@ async def get_graph_data():
         "total_units": len(units)
     }
 
+memory = TemporalSemanticMemory()
 
 @app.get("/")
 async def index():
@@ -204,15 +223,13 @@ async def api_search(request: SearchRequest):
     """Run a search and return results with trace."""
     try:
         # Initialize memory system
-        memory = TemporalSemanticMemory()
-
         # Run search with tracing
         results, trace = await memory.search_async(
             agent_id=request.agent_id,
             query=request.query,
             thinking_budget=request.thinking_budget,
             top_k=request.top_k,
-            enable_trace=True,
+            enable_trace=request.trace,
             mmr_lambda=request.mmr_lambda
         )
 
@@ -258,6 +275,72 @@ async def api_agents():
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.post("/api/memories/batch")
+async def api_batch_put(request: BatchPutRequest):
+    """
+    Store multiple memories in batch.
+
+    This endpoint calls put_batch_async to efficiently store multiple memory items.
+    Supports document tracking and upsert operations.
+
+    Example request:
+    {
+        "agent_id": "user123",
+        "items": [
+            {"content": "Alice works at Google", "context": "work"},
+            {"content": "Bob went hiking yesterday", "event_date": "2024-01-15T10:00:00Z"}
+        ],
+        "document_id": "conversation_123",
+        "upsert": false
+    }
+    """
+    try:
+        # Validate agent_id - prevent writing to reserved agents
+        RESERVED_AGENT_IDS = {"locomo"}
+        if request.agent_id in RESERVED_AGENT_IDS:
+            raise HTTPException(
+                status_code=403,
+                detail=f"Cannot write to reserved agent_id '{request.agent_id}'. Reserved agents: {', '.join(RESERVED_AGENT_IDS)}"
+            )
+
+        # Initialize memory system
+
+
+        # Prepare contents for put_batch_async
+        contents = []
+        for item in request.items:
+            content_dict = {"content": item.content}
+            if item.event_date:
+                content_dict["event_date"] = item.event_date
+            if item.context:
+                content_dict["context"] = item.context
+            contents.append(content_dict)
+
+        # Call put_batch_async
+        result = await memory.put_batch_async(
+            agent_id=request.agent_id,
+            contents=contents,
+            document_id=request.document_id,
+            document_metadata=request.document_metadata,
+            upsert=request.upsert
+        )
+
+        await memory.close()
+
+        return {
+            "success": True,
+            "message": f"Successfully stored {len(contents)} memory items",
+            "agent_id": request.agent_id,
+            "document_id": request.document_id,
+            "items_count": len(contents)
+        }
+    except Exception as e:
+        import traceback
+        error_detail = f"{str(e)}\n\nTraceback:\n{traceback.format_exc()}"
+        print(f"Error in /api/memories/batch: {error_detail}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.get("/api/locomo")
 async def api_locomo():
     """Get Locomo benchmark results."""
@@ -283,9 +366,11 @@ if __name__ == "__main__":
     print("=" * 80)
     print("\nStarting server at http://localhost:8080")
     print("\nEndpoints:")
-    print("  GET  /              - Visualization UI")
-    print("  GET  /api/graph     - Get graph data")
-    print("  POST /api/search    - Run search with trace")
+    print("  GET  /                    - Visualization UI")
+    print("  GET  /api/graph           - Get graph data")
+    print("  POST /api/search          - Run search with trace")
+    print("  POST /api/memories/batch  - Store multiple memories in batch")
+    print("  GET  /api/agents          - List available agents")
     print("\n" + "=" * 80 + "\n")
 
     uvicorn.run("server:app", host="0.0.0.0", port=8080, reload=True)

@@ -483,7 +483,8 @@ window.runSearchInPane = async function(paneId) {
                 agent_id: agentId,
                 thinking_budget: thinkingBudget,
                 top_k: topK,
-                mmr_lambda: mmrLambda
+                mmr_lambda: mmrLambda,
+                trace: true
             })
         });
 
