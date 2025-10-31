@@ -47,9 +47,10 @@ class LinkInfo(BaseModel):
     link_type: Literal["temporal", "semantic", "entity"] = Field(description="Type of link")
     link_weight: float = Field(description="Weight of the link", ge=0.0, le=1.0)
     entity_id: Optional[str] = Field(default=None, description="Entity ID if link_type is 'entity'")
-    new_activation: float = Field(description="Activation that would be passed to neighbor")
+    new_activation: Optional[float] = Field(default=None, description="Activation that would be passed to neighbor (None for supplementary links)")
     followed: bool = Field(description="Whether this link was followed (or pruned)")
     prune_reason: Optional[str] = Field(default=None, description="Why link was not followed (if not followed)")
+    is_supplementary: bool = Field(default=False, description="Whether this is a supplementary link (multiple connections to same node)")
 
 
 class NodeVisit(BaseModel):

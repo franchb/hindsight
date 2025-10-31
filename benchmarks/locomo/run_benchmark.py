@@ -129,6 +129,9 @@ def generate_markdown_table(results: dict):
 
 
 if __name__ == "__main__":
+    import logging
+    logging.basicConfig(level=logging.INFO)
+
     parser = argparse.ArgumentParser(description='Run LoComo benchmark')
     parser.add_argument('--max-conversations', type=int, default=None, help='Maximum conversations to evaluate')
     parser.add_argument('--max-questions', type=int, default=None, help='Maximum questions per conversation')

@@ -313,6 +313,10 @@ function addDebugPane() {
                     <label style="font-weight: bold; display: block; margin-bottom: 3px; font-size: 12px;">Top K:</label>
                     <input type="number" id="search-top-k-${paneId}" value="10" min="1" max="50" style="width: 60px; padding: 6px; border: 1px solid #ccc; border-radius: 4px; font-size: 12px;">
                 </div>
+                <div>
+                    <label style="font-weight: bold; display: block; margin-bottom: 3px; font-size: 12px;" title="MMR Lambda: 0=max diversity, 1=no diversity">MMR λ:</label>
+                    <input type="number" id="search-mmr-lambda-${paneId}" value="0.5" min="0" max="1" step="0.1" style="width: 60px; padding: 6px; border: 1px solid #ccc; border-radius: 4px; font-size: 12px;">
+                </div>
                 <button onclick="runSearchInPane(${paneId})" style="padding: 6px 16px; background: #42a5f5; color: white; border: none; border-radius: 4px; cursor: pointer; font-weight: bold; font-size: 12px;">🔍 Search</button>
             </div>
         </div>
@@ -336,6 +340,10 @@ function addDebugPane() {
                 <label>
                     <input type="checkbox" id="debug-highlight-path-${paneId}"> Highlight top result path
                 </label>
+                <span style="margin-left: 15px;">
+                    <input type="text" id="graph-search-${paneId}" placeholder="Find nodes..." style="width: 150px; padding: 4px 8px; border: 1px solid #ccc; border-radius: 4px; font-size: 12px;">
+                    <span id="graph-search-count-${paneId}" style="margin-left: 5px; font-size: 12px; color: #666;"></span>
+                </span>
             </span>
         </div>
         <div class="debug-viz-container">
@@ -394,6 +402,14 @@ function addDebugPane() {
         }
     });
 
+    // Add search input listener for finding nodes
+    document.getElementById(`graph-search-${paneId}`).addEventListener('input', function(e) {
+        const pane = debugPanes.find(p => p.id === paneId);
+        if (pane && pane.cy) {
+            highlightMatchingNodes(paneId, e.target.value);
+        }
+    });
+
     debugPanes.push({
         id: paneId,
         element: paneDiv,
@@ -446,6 +462,7 @@ window.runSearchInPane = async function(paneId) {
     const agentId = document.getElementById(`search-agent-${paneId}`).value;
     const thinkingBudget = parseInt(document.getElementById(`search-budget-${paneId}`).value);
     const topK = parseInt(document.getElementById(`search-top-k-${paneId}`).value);
+    const mmrLambda = parseFloat(document.getElementById(`search-mmr-lambda-${paneId}`).value);
     const statusBar = document.getElementById(`debug-status-${paneId}`);
 
     if (!query) {
@@ -465,7 +482,8 @@ window.runSearchInPane = async function(paneId) {
                 query: query,
                 agent_id: agentId,
                 thinking_budget: thinkingBudget,
-                top_k: topK
+                top_k: topK,
+                mmr_lambda: mmrLambda
             })
         });
 
@@ -536,16 +554,28 @@ function renderResultsTable(paneId, results, trace) {
         return;
     }
 
+    // Check if MMR was used
+    const mmrUsed = results.some(r => r.mmr_score !== null && r.mmr_score !== undefined);
+
     let html = `
         <div style="padding: 20px; overflow: auto; height: 100%;">
             <h3>Search Results (${results.length} memories)</h3>
-            <p style="color: #666; font-size: 13px; margin-bottom: 15px;">
+            <p style="color: #666; font-size: 13px; margin-bottom: 10px;">
                 Query: "${trace.query.query_text}"
             </p>
+            ${mmrUsed ? `
+            <div style="background: #e3f2fd; padding: 10px; border-left: 4px solid #2196f3; margin-bottom: 15px; font-size: 12px;">
+                <strong>MMR Diversification Active:</strong>
+                🎯 = Diversified pick (selected for variety) |
+                <span style="background: #fff3e0; padding: 2px 6px; border-radius: 3px;">Orange background</span> = Rank changed by MMR |
+                <strong>Orig Rank</strong> shows position before MMR reranking
+            </div>
+            ` : ''}
             <table style="width: 100%; border-collapse: collapse; font-size: 12px;">
                 <thead>
                     <tr style="background: #f0f0f0; border: 2px solid #333;">
                         <th style="padding: 8px; text-align: left; border: 1px solid #ddd;">Rank</th>
+                        <th style="padding: 8px; text-align: left; border: 1px solid #ddd;" title="Original rank before MMR">Orig Rank</th>
                         <th style="padding: 8px; text-align: left; border: 1px solid #ddd;">Text</th>
                         <th style="padding: 8px; text-align: left; border: 1px solid #ddd;">Context</th>
                         <th style="padding: 8px; text-align: left; border: 1px solid #ddd;">Date</th>
@@ -554,6 +584,9 @@ function renderResultsTable(paneId, results, trace) {
                         <th style="padding: 8px; text-align: left; border: 1px solid #ddd;" title="Semantic similarity to query">Similarity</th>
                         <th style="padding: 8px; text-align: left; border: 1px solid #ddd;" title="Recency boost">Recency</th>
                         <th style="padding: 8px; text-align: left; border: 1px solid #ddd;" title="Frequency boost">Frequency</th>
+                        <th style="padding: 8px; text-align: left; border: 1px solid #ddd;" title="MMR score (relevance - diversity penalty)">MMR Score</th>
+                        <th style="padding: 8px; text-align: left; border: 1px solid #ddd;" title="Normalized relevance component">MMR Rel</th>
+                        <th style="padding: 8px; text-align: left; border: 1px solid #ddd;" title="Max similarity to already selected">MMR Sim</th>
                     </tr>
                 </thead>
                 <tbody>
@@ -570,9 +603,21 @@ function renderResultsTable(paneId, results, trace) {
         const recency = visit ? (visit.weights.recency || 0) : 0;
         const frequency = visit ? (visit.weights.frequency || 0) : 0;
 
+        // Get MMR information
+        const originalRank = result.original_rank || (idx + 1);
+        const mmrScore = result.mmr_score;
+        const mmrRelevance = result.mmr_relevance;
+        const mmrMaxSim = result.mmr_max_similarity;
+        const isDiversified = result.mmr_diversified || false;
+
+        // Highlight diversified results
+        const rowBg = isDiversified ? '#fff3e0' : 'white';
+        const rankDisplay = originalRank !== (idx + 1) ? `<span style="color: #ff9800;" title="Rank changed by MMR">↑${originalRank}</span>` : originalRank;
+
         html += `
-            <tr style="border: 1px solid #ddd;">
-                <td style="padding: 8px; border: 1px solid #ddd; font-weight: bold;">#${idx + 1}</td>
+            <tr style="border: 1px solid #ddd; background: ${rowBg};">
+                <td style="padding: 8px; border: 1px solid #ddd; font-weight: bold;">#${idx + 1}${isDiversified ? ' 🎯' : ''}</td>
+                <td style="padding: 8px; border: 1px solid #ddd;">${rankDisplay}</td>
                 <td style="padding: 8px; border: 1px solid #ddd; max-width: 300px;">${result.text}</td>
                 <td style="padding: 8px; border: 1px solid #ddd; max-width: 150px;">${result.context || 'N/A'}</td>
                 <td style="padding: 8px; border: 1px solid #ddd; white-space: nowrap;">${result.event_date ? new Date(result.event_date).toLocaleDateString() : 'N/A'}</td>
@@ -581,6 +626,9 @@ function renderResultsTable(paneId, results, trace) {
                 <td style="padding: 8px; border: 1px solid #ddd;">${similarity.toFixed(4)}</td>
                 <td style="padding: 8px; border: 1px solid #ddd;">${recency.toFixed(4)}</td>
                 <td style="padding: 8px; border: 1px solid #ddd;">${frequency.toFixed(4)}</td>
+                <td style="padding: 8px; border: 1px solid #ddd;">${mmrScore !== null && mmrScore !== undefined ? mmrScore.toFixed(4) : '-'}</td>
+                <td style="padding: 8px; border: 1px solid #ddd;">${mmrRelevance !== null && mmrRelevance !== undefined ? mmrRelevance.toFixed(4) : '-'}</td>
+                <td style="padding: 8px; border: 1px solid #ddd;">${mmrMaxSim !== null && mmrMaxSim !== undefined ? mmrMaxSim.toFixed(4) : '-'}</td>
             </tr>
         `;
     });
@@ -1019,6 +1067,73 @@ function visualizeTrace(paneId, trace) {
         const statusBar = document.getElementById(`debug-status-${paneId}`);
         if (statusBar) {
             statusBar.innerHTML = `<span style="color: #d32f2f;">❌ Error visualizing trace: ${e.message}</span>`;
+        }
+    }
+}
+
+function highlightMatchingNodes(paneId, searchText) {
+    const pane = debugPanes.find(p => p.id === paneId);
+    if (!pane || !pane.cy) return;
+
+    const countSpan = document.getElementById(`graph-search-count-${paneId}`);
+
+    // If search is empty, reset all styles
+    if (!searchText || searchText.trim() === '') {
+        pane.cy.nodes().style({
+            'opacity': 1,
+            'border-width': 2,
+            'border-color': '#333'
+        });
+        pane.cy.edges().style({
+            'opacity': 0.8
+        });
+        if (countSpan) countSpan.textContent = '';
+        return;
+    }
+
+    const searchLower = searchText.toLowerCase();
+    let matchCount = 0;
+    const totalNodes = pane.cy.nodes().length;
+
+    // Check each node for matches
+    pane.cy.nodes().forEach(node => {
+        const data = node.data();
+        const text = (data.text || '').toLowerCase();
+        const label = (data.label || '').toLowerCase();
+
+        const matches = text.includes(searchLower) || label.includes(searchLower);
+
+        if (matches) {
+            matchCount++;
+            // Highlight matching nodes - full opacity with thicker orange border
+            node.style({
+                'opacity': 1,
+                'border-width': 4,
+                'border-color': '#ff6f00'
+            });
+        } else {
+            // Dim non-matching nodes
+            node.style({
+                'opacity': 0.2,
+                'border-width': 2,
+                'border-color': '#333'
+            });
+        }
+    });
+
+    // Dim all edges
+    pane.cy.edges().style({
+        'opacity': 0.2
+    });
+
+    // Update counter
+    if (countSpan) {
+        if (matchCount === 0) {
+            countSpan.textContent = '(no matches)';
+            countSpan.style.color = '#d32f2f';
+        } else {
+            countSpan.textContent = `(${matchCount} of ${totalNodes})`;
+            countSpan.style.color = '#43a047';
         }
     }
 }

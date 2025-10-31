@@ -6,10 +6,23 @@ CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 -- TEMPORAL + SEMANTIC + ENTITY MEMORY ARCHITECTURE
 -- ============================================================================
 
+-- Documents: Source of memory units (for tracking, updates, and deletion)
+CREATE TABLE IF NOT EXISTS documents (
+    id TEXT NOT NULL,  -- User-provided document ID
+    agent_id TEXT NOT NULL,
+    PRIMARY KEY (id, agent_id),
+    original_text TEXT,  -- Full original content (for context expansion)
+    content_hash TEXT,  -- SHA256 hash for deduplication
+    metadata JSONB DEFAULT '{}'::jsonb,  -- User-provided metadata
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
 -- Memory Units: Individual sentence-level memories
 CREATE TABLE IF NOT EXISTS memory_units (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     agent_id TEXT NOT NULL,
+    document_id TEXT,  -- Link to source document
     text TEXT NOT NULL,
     embedding vector(384),  -- bge-small-en-v1.5 dimension
     context TEXT,  -- What was happening when this memory was formed
@@ -64,11 +77,34 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_memory_links_unique
 ON memory_links (from_unit_id, to_unit_id, link_type, COALESCE(entity_id, '00000000-0000-0000-0000-000000000000'::uuid));
 
 -- ============================================================================
+-- FOREIGN KEY CONSTRAINTS
+-- ============================================================================
+
+-- Add foreign key from memory_units to documents (composite key)
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint WHERE conname = 'memory_units_document_fkey'
+    ) THEN
+        ALTER TABLE memory_units
+            ADD CONSTRAINT memory_units_document_fkey
+            FOREIGN KEY (document_id, agent_id)
+            REFERENCES documents(id, agent_id)
+            ON DELETE CASCADE;
+    END IF;
+END $$;
+
+-- ============================================================================
 -- INDEXES
 -- ============================================================================
 
+-- Document indexes
+CREATE INDEX IF NOT EXISTS idx_documents_agent_id ON documents(agent_id);
+CREATE INDEX IF NOT EXISTS idx_documents_content_hash ON documents(content_hash);
+
 -- Memory unit indexes
 CREATE INDEX IF NOT EXISTS idx_memory_units_agent_id ON memory_units(agent_id);
+CREATE INDEX IF NOT EXISTS idx_memory_units_document_id ON memory_units(document_id);
 CREATE INDEX IF NOT EXISTS idx_memory_units_event_date ON memory_units(event_date DESC);
 CREATE INDEX IF NOT EXISTS idx_memory_units_agent_date ON memory_units(agent_id, event_date DESC);
 CREATE INDEX IF NOT EXISTS idx_memory_units_access_count ON memory_units(access_count DESC);

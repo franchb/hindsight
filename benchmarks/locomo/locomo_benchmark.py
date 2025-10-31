@@ -113,7 +113,19 @@ class QuestionAnswer(pydantic.BaseModel):
 
 
 class LoComoAnswerGenerator(LLMAnswerGenerator):
-    """LoComo-specific answer generator using OpenAI."""
+    """LoComo-specific answer generator using Groq."""
+
+    def __init__(self):
+        """Initialize with Groq client."""
+        groq_api_key = os.getenv('GROQ_API_KEY')
+        if not groq_api_key:
+            raise ValueError("GROQ_API_KEY environment variable not set")
+
+        base_url = os.getenv('GROQ_BASE_URL', 'https://api.groq.com/openai/v1')
+        self.client = AsyncOpenAI(
+            api_key=groq_api_key,
+            base_url=base_url
+        )
 
     async def generate_answer(
         self,
@@ -121,23 +133,22 @@ class LoComoAnswerGenerator(LLMAnswerGenerator):
         memories: List[Dict[str, Any]]
     ) -> Tuple[str, str]:
         """
-        Generate answer from retrieved memories using OpenAI.
+        Generate answer from retrieved memories using Groq.
 
         Returns:
             Tuple of (answer, reasoning)
         """
         # Format context
         context_parts = []
-        for i, result in enumerate(memories):
-            context_parts.append(f"{i}. {result['text']}")
+        for result in memories:
+            context_parts.append({"text": result.get("text"), "context": result.get("context"), "event_date": result.get("event_date")})
 
-        context = "\n".join(context_parts)
+        context = json.dumps(context_parts)
 
-        # Use OpenAI to generate answer
+        # Use Groq to generate answer
         try:
-            client = AsyncOpenAI()
-            response = await client.beta.chat.completions.parse(
-                model="gpt-5",
+            response = await self.client.beta.chat.completions.parse(
+                model="openai/gpt-oss-120b",
                 messages=[
                     {
                         "role": "system",
@@ -238,15 +249,37 @@ class LoComoAnswerEvaluator(LLMAnswerEvaluator):
                     messages=[
                         {
                             "role": "system",
-                            "content": "You are an objective judge. Determine if the predicted answer contains the correct answer or they are the same content (with different form is fine)."
+                            "content": "You are an expert grader that determines if answers to questions match a gold standard answer"
                         },
                         {
                             "role": "user",
-                            "content": f"Question: {question}\nCorrect answer: {correct_answer}\nPredicted answer: {predicted_answer}\n\nAre they equivalent?"
+                            "content": f"""
+Your task is to label an answer to a question as ’CORRECT’ or ’WRONG’. You williolw23 be given the following data:
+        (1) a question (posed by one user to another user), 
+        (2) a ’gold’ (ground truth) answer, 
+        (3) a generated answer
+    which you will score as CORRECT/WRONG.
+
+    The point of the question is to ask about something one user should know about the other user based on their prior conversations.
+    The gold answer will usually be a concise and short answer that includes the referenced topic, for example:
+    Question: Do you remember what I got the last time I went to Hawaii?
+    Gold answer: A shell necklace
+    The generated answer might be much longer, but you should be generous with your grading - as long as it touches on the same topic as the gold answer, it should be counted as CORRECT. 
+
+    For time related questions, the gold answer will be a specific date, month, year, etc. The generated answer might be much longer or use relative time references (like "last Tuesday" or "next month"), but you should be generous with your grading - as long as it refers to the same date or time period as the gold answer, it should be counted as CORRECT. Even if the format differs (e.g., "May 7th" vs "7 May"), consider it CORRECT if it's the same date.
+
+    Now it’s time for the real question:
+    Question: {question}
+    Gold answer: {correct_answer}
+    Generated answer: {predicted_answer}
+
+    First, provide a short (one sentence) explanation of your reasoning. Short reasoning is preferred.
+    If it's correct, set correct=true.
+"""
                         }
                     ],
                     temperature=0,
-                    max_tokens=512,
+                    max_tokens=4096,
                     response_format=JudgeResponse
                 )
 

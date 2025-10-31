@@ -18,6 +18,8 @@ import asyncio
 import time
 from concurrent.futures import ProcessPoolExecutor
 import numpy as np
+import uuid
+import logging
 
 from .utils import (
     extract_facts,
@@ -31,6 +33,9 @@ def utcnow():
     """Get current UTC time with timezone info."""
     return datetime.now(timezone.utc)
 
+
+# Logger for memory system
+logger = logging.getLogger(__name__)
 
 # Global process pool for parallel embedding generation
 # Each process loads its own copy of the embedding model
@@ -106,9 +111,9 @@ class TemporalSemanticMemory:
         self.entity_resolver = None
 
         # Initialize local embedding model (384 dimensions)
-        print(f"Loading embedding model: {embedding_model}...")
+        logger.info(f"Loading embedding model: {embedding_model}...")
         self.embedding_model = SentenceTransformer(embedding_model)
-        print(f"✓ Model loaded (embedding dim: {self.embedding_model.get_sentence_embedding_dimension()})")
+        logger.info(f"Model loaded (embedding dim: {self.embedding_model.get_sentence_embedding_dimension()})")
 
         # Background queue for access count updates (to avoid blocking searches)
         self._access_count_queue = asyncio.Queue()
@@ -143,18 +148,20 @@ class TemporalSemanticMemory:
                 if updates:
                     node_id_list = list(updates.keys())
                     try:
+                        # Convert string UUIDs to UUID type for faster matching
+                        uuid_list = [uuid.UUID(nid) for nid in node_id_list]
                         async with pool.acquire() as conn:
                             await conn.execute(
-                                "UPDATE memory_units SET access_count = access_count + 1 WHERE id::text = ANY($1)",
-                                node_id_list
+                                "UPDATE memory_units SET access_count = access_count + 1 WHERE id = ANY($1::uuid[])",
+                                uuid_list
                             )
                     except Exception as e:
-                        print(f"[ACCESS_COUNT_WORKER] Error updating access counts: {e}")
+                        logger.error(f"Access count worker: Error updating access counts: {e}")
 
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                print(f"[ACCESS_COUNT_WORKER] Unexpected error: {e}")
+                logger.error(f"Access count worker: Unexpected error: {e}")
                 await asyncio.sleep(1)  # Backoff on error
 
     async def _get_pool(self) -> asyncpg.Pool:
@@ -330,6 +337,9 @@ class TemporalSemanticMemory:
         content: str,
         context: str = "",
         event_date: Optional[datetime] = None,
+        document_id: Optional[str] = None,
+        document_metadata: Optional[Dict[str, Any]] = None,
+        upsert: bool = False,
     ) -> List[str]:
         """
         Store content as memory units with temporal and semantic links (ASYNC version).
@@ -341,6 +351,9 @@ class TemporalSemanticMemory:
             content: Text content to store
             context: Context about when/why this memory was formed
             event_date: When the event occurred (defaults to now)
+            document_id: Optional document ID for tracking and upsert
+            document_metadata: Optional metadata about the document
+            upsert: If True and document_id exists, delete old units and create new ones
 
         Returns:
             List of created unit IDs
@@ -352,7 +365,10 @@ class TemporalSemanticMemory:
                 "content": content,
                 "context": context,
                 "event_date": event_date
-            }]
+            }],
+            document_id=document_id,
+            document_metadata=document_metadata,
+            upsert=upsert
         )
 
         # Return the first (and only) list of unit IDs
@@ -362,6 +378,9 @@ class TemporalSemanticMemory:
         self,
         agent_id: str,
         contents: List[Dict[str, Any]],
+        document_id: Optional[str] = None,
+        document_metadata: Optional[Dict[str, Any]] = None,
+        upsert: bool = False,
     ) -> List[List[str]]:
         """
         Store multiple content items as memory units in ONE batch operation.
@@ -377,6 +396,9 @@ class TemporalSemanticMemory:
                 - "content" (required): Text content to store
                 - "context" (optional): Context about the memory
                 - "event_date" (optional): When the event occurred
+            document_id: Optional document ID for tracking and upsert
+            document_metadata: Optional metadata about the document
+            upsert: If True and document_id exists, delete old units and create new ones
 
         Returns:
             List of lists of unit IDs (one list per content item)
@@ -387,15 +409,17 @@ class TemporalSemanticMemory:
                 contents=[
                     {"content": "Alice works at Google", "context": "conversation"},
                     {"content": "Bob loves Python", "context": "conversation"},
-                ]
+                ],
+                document_id="meeting-2024-01-15",
+                upsert=True
             )
             # Returns: [["unit-id-1"], ["unit-id-2"]]
         """
         start_time = time.time()
-        print(f"\n{'='*60}")
-        print(f"PUT_BATCH_ASYNC START: {agent_id}")
-        print(f"Batch size: {len(contents)} content items")
-        print(f"{'='*60}")
+        logger.debug(f"\n{'='*60}")
+        logger.debug(f"PUT_BATCH_ASYNC START: {agent_id}")
+        logger.debug(f"Batch size: {len(contents)} content items")
+        logger.debug(f"{'='*60}")
 
         if not contents:
             return []
@@ -420,6 +444,7 @@ class TemporalSemanticMemory:
         all_fact_texts = []
         all_fact_dates = []
         all_contexts = []
+        all_fact_entities = []  # NEW: Store LLM-extracted entities per fact
         content_boundaries = []  # [(start_idx, end_idx), ...]
 
         current_idx = 0
@@ -435,6 +460,8 @@ class TemporalSemanticMemory:
                 except Exception:
                     all_fact_dates.append(event_date)
                 all_contexts.append(context)
+                # Extract entities from fact (default to empty list if not present)
+                all_fact_entities.append(fact_dict.get('entities', []))
 
             end_idx = current_idx + len(fact_dicts)
             content_boundaries.append((start_idx, end_idx))
@@ -448,13 +475,51 @@ class TemporalSemanticMemory:
         # Step 2: Generate ALL embeddings in ONE batch (HUGE speedup!)
         step_start = time.time()
         all_embeddings = await self._generate_embeddings_batch(all_fact_texts)
-        print(f"[2] Generate embeddings (parallel): {len(all_embeddings)} embeddings in {time.time() - step_start:.3f}s")
+        logger.debug(f"[2] Generate embeddings (parallel): {len(all_embeddings)} embeddings in {time.time() - step_start:.3f}s")
 
         # Step 3: Process everything in ONE database transaction
         pool = await self._get_pool()
         async with pool.acquire() as conn:
             async with conn.transaction():
                 try:
+                    # Handle document tracking and upsert
+                    if document_id:
+                        import hashlib
+                        import json
+
+                        # Calculate content hash from all content items
+                        combined_content = "\n".join([c.get("content", "") for c in contents])
+                        content_hash = hashlib.sha256(combined_content.encode()).hexdigest()
+
+                        # If upsert, delete old document first (cascades to units and links)
+                        if upsert:
+                            deleted = await conn.fetchval(
+                                "DELETE FROM documents WHERE id = $1 AND agent_id = $2 RETURNING id",
+                                document_id, agent_id
+                            )
+                            if deleted:
+                                logger.debug(f"[3.1] Upsert: Deleted existing document '{document_id}' and all its units")
+
+                        # Insert or update document
+                        # Always use ON CONFLICT for idempotent behavior
+                        await conn.execute(
+                            """
+                            INSERT INTO documents (id, agent_id, original_text, content_hash, metadata)
+                            VALUES ($1, $2, $3, $4, $5)
+                            ON CONFLICT (id, agent_id) DO UPDATE
+                            SET original_text = EXCLUDED.original_text,
+                                content_hash = EXCLUDED.content_hash,
+                                metadata = EXCLUDED.metadata,
+                                updated_at = NOW()
+                            """,
+                            document_id,
+                            agent_id,
+                            combined_content,
+                            content_hash,
+                            json.dumps(document_metadata or {})
+                        )
+                        logger.debug(f"[3.2] Document '{document_id}' stored/updated")
+
                     # Deduplication check for all facts
                     step_start = time.time()
                     all_is_duplicate = []
@@ -466,16 +531,17 @@ class TemporalSemanticMemory:
 
                     duplicates_filtered = sum(all_is_duplicate)
                     new_facts = total_facts - duplicates_filtered
-                    print(f"[3] Deduplication check: {duplicates_filtered} duplicates filtered, {new_facts} new facts in {time.time() - step_start:.3f}s")
+                    logger.debug(f"[3] Deduplication check: {duplicates_filtered} duplicates filtered, {new_facts} new facts in {time.time() - step_start:.3f}s")
 
                     # Filter out duplicates
                     filtered_sentences = [s for s, is_dup in zip(all_fact_texts, all_is_duplicate) if not is_dup]
                     filtered_embeddings = [e for e, is_dup in zip(all_embeddings, all_is_duplicate) if not is_dup]
                     filtered_dates = [d for d, is_dup in zip(all_fact_dates, all_is_duplicate) if not is_dup]
                     filtered_contexts = [c for c, is_dup in zip(all_contexts, all_is_duplicate) if not is_dup]
+                    filtered_entities = [ents for ents, is_dup in zip(all_fact_entities, all_is_duplicate) if not is_dup]
 
                     if not filtered_sentences:
-                        print(f"[PUT_BATCH_ASYNC] All facts were duplicates, returning empty")
+                        logger.debug(f"[PUT_BATCH_ASYNC] All facts were duplicates, returning empty")
                         return [[] for _ in contents]
 
                     # Batch insert ALL units
@@ -484,11 +550,12 @@ class TemporalSemanticMemory:
                     filtered_embeddings_str = [str(emb) for emb in filtered_embeddings]
                     results = await conn.fetch(
                         """
-                        INSERT INTO memory_units (agent_id, text, context, embedding, event_date, access_count)
-                        SELECT * FROM unnest($1::text[], $2::text[], $3::text[], $4::vector[], $5::timestamptz[], $6::integer[])
+                        INSERT INTO memory_units (agent_id, document_id, text, context, embedding, event_date, access_count)
+                        SELECT * FROM unnest($1::text[], $2::text[], $3::text[], $4::text[], $5::vector[], $6::timestamptz[], $7::integer[])
                         RETURNING id
                         """,
                         [agent_id] * len(filtered_sentences),
+                        [document_id] * len(filtered_sentences) if document_id else [None] * len(filtered_sentences),
                         filtered_sentences,
                         filtered_contexts,
                         filtered_embeddings_str,
@@ -497,34 +564,34 @@ class TemporalSemanticMemory:
                     )
 
                     created_unit_ids = [str(row['id']) for row in results]
-                    print(f"[5] Batch insert units: {len(created_unit_ids)} units in {time.time() - step_start:.3f}s")
+                    logger.debug(f"[5] Batch insert units: {len(created_unit_ids)} units in {time.time() - step_start:.3f}s")
 
                     # Process entities for ALL units
                     step_start = time.time()
                     all_entity_links = await self._extract_entities_batch_optimized(
-                        conn, agent_id, created_unit_ids, filtered_sentences, "", filtered_dates
+                        conn, agent_id, created_unit_ids, filtered_sentences, "", filtered_dates, filtered_entities
                     )
-                    print(f"[6] Extract entities (batched): {time.time() - step_start:.3f}s")
+                    logger.debug(f"[6] Process entities (batched): {time.time() - step_start:.3f}s")
 
                     # Create temporal links
                     step_start = time.time()
                     await self._create_temporal_links_batch_per_fact(conn, agent_id, created_unit_ids)
-                    print(f"[7] Batch create temporal links: {time.time() - step_start:.3f}s")
+                    logger.debug(f"[7] Batch create temporal links: {time.time() - step_start:.3f}s")
 
                     # Create semantic links
                     step_start = time.time()
                     await self._create_semantic_links_batch(conn, agent_id, created_unit_ids, filtered_embeddings)
-                    print(f"[8] Batch create semantic links: {time.time() - step_start:.3f}s")
+                    logger.debug(f"[8] Batch create semantic links: {time.time() - step_start:.3f}s")
 
                     # Insert entity links
                     step_start = time.time()
                     if all_entity_links:
                         await self._insert_entity_links_batch(conn, all_entity_links)
-                    print(f"[9] Batch insert entity links: {time.time() - step_start:.3f}s")
+                    logger.debug(f"[9] Batch insert entity links: {time.time() - step_start:.3f}s")
 
                     # Transaction auto-commits on success
                     commit_start = time.time()
-                    print(f"[10] Commit: {time.time() - commit_start:.3f}s")
+                    logger.debug(f"[10] Commit: {time.time() - commit_start:.3f}s")
 
                     # Map created unit IDs back to original content items
                     # Account for duplicates when mapping back
@@ -540,9 +607,9 @@ class TemporalSemanticMemory:
                         result_unit_ids.append(content_unit_ids)
 
                     total_time = time.time() - start_time
-                    print(f"\n{'='*60}")
-                    print(f"PUT_BATCH_ASYNC COMPLETE: {len(created_unit_ids)} units from {len(contents)} contents in {total_time:.3f}s")
-                    print(f"{'='*60}\n")
+                    logger.debug(f"\n{'='*60}")
+                    logger.debug(f"PUT_BATCH_ASYNC COMPLETE: {len(created_unit_ids)} units from {len(contents)} contents in {total_time:.3f}s")
+                    logger.debug(f"{'='*60}\n")
 
                     return result_unit_ids
 
@@ -563,6 +630,7 @@ class TemporalSemanticMemory:
         weight_semantic: float = 0.30,
         weight_recency: float = 0.25,
         weight_frequency: float = 0.15,
+        mmr_lambda: float = 0.5,
     ) -> tuple[List[Dict[str, Any]], Optional[Any]]:
         """
         Search memories using spreading activation (synchronous wrapper).
@@ -580,6 +648,7 @@ class TemporalSemanticMemory:
             weight_semantic: Weight for semantic similarity component (default: 0.30)
             weight_recency: Weight for recency component (default: 0.25)
             weight_frequency: Weight for frequency component (default: 0.15)
+            mmr_lambda: Lambda for MMR diversification (0=max diversity, 1=no diversity, default: 0.5)
 
         Returns:
             Tuple of (results, trace)
@@ -587,7 +656,7 @@ class TemporalSemanticMemory:
         # Run async version synchronously
         return asyncio.run(self.search_async(
             agent_id, query, thinking_budget, top_k, enable_trace,
-            weight_activation, weight_semantic, weight_recency, weight_frequency
+            weight_activation, weight_semantic, weight_recency, weight_frequency, mmr_lambda
         ))
 
     async def search_async(
@@ -601,6 +670,7 @@ class TemporalSemanticMemory:
         weight_semantic: float = 0.30,
         weight_recency: float = 0.25,
         weight_frequency: float = 0.15,
+        mmr_lambda: float = 0.5,
     ) -> tuple[List[Dict[str, Any]], Optional[Any]]:
         """
         Search memories using spreading activation (ASYNC version).
@@ -629,14 +699,18 @@ class TemporalSemanticMemory:
 
         pool = await self._get_pool()
         search_start = time.time()
-        print(f"\n[SEARCH] Starting search for query: '{query[:50]}...' (thinking_budget={thinking_budget}, top_k={top_k})")
+
+        # Buffer logs for clean output in concurrent scenarios
+        search_id = f"{agent_id[:8]}-{int(time.time() * 1000) % 100000}"
+        log_buffer = []
+        log_buffer.append(f"[SEARCH {search_id}] Query: '{query[:50]}...' (budget={thinking_budget}, top_k={top_k})")
 
         try:
             # Step 1: Generate query embedding (CPU-bound, no DB needed)
             step_start = time.time()
             query_embedding = self._generate_embedding(query)
             step_duration = time.time() - step_start
-            print(f"  [1] Generate query embedding: {step_duration:.3f}s")
+            log_buffer.append(f"  [1] Generate query embedding: {step_duration:.3f}s")
 
             if tracer:
                 tracer.record_query_embedding(query_embedding)
@@ -651,7 +725,7 @@ class TemporalSemanticMemory:
             async with pool.acquire() as conn:
                 conn_acquire_time = time.time() - conn_acquire_start
                 if conn_acquire_time > 0.1:  # Log if waiting > 100ms
-                    print(f"      [2.1] Waited {conn_acquire_time:.3f}s for connection (pool busy)")
+                    log_buffer.append(f"      [2.1] Waited {conn_acquire_time:.3f}s for connection (pool busy)")
 
                 entry_points = await conn.fetch(
                     """
@@ -668,7 +742,7 @@ class TemporalSemanticMemory:
                 )
 
             step_duration = time.time() - step_start
-            print(f"  [2] Find entry points: {len(entry_points)} found in {step_duration:.3f}s")
+            log_buffer.append(f"  [2] Find entry points: {len(entry_points)} found in {step_duration:.3f}s")
 
             if tracer:
                 tracer.add_phase_metric("find_entry_points", step_duration, {"count": len(entry_points)})
@@ -681,7 +755,7 @@ class TemporalSemanticMemory:
                     )
 
             if not entry_points:
-                print(f"[SEARCH] Complete: 0 results in {time.time() - search_start:.3f}s")
+                logger.debug(f"[SEARCH] Complete: 0 results in {time.time() - search_start:.3f}s")
                 if tracer:
                     trace = tracer.finalize([])
                     return [], trace
@@ -734,10 +808,12 @@ class TemporalSemanticMemory:
                 async with pool.acquire() as conn:
                     batch_conn_acquire = time.time() - batch_conn_start
                     if batch_conn_acquire > 0.1:  # Log if waiting > 100ms
-                        print(f"      [3.3.1] Waited {batch_conn_acquire:.3f}s for connection (pool busy) - batch size: {len(node_ids)}")
+                        log_buffer.append(f"      [3.3.1] Waited {batch_conn_acquire:.3f}s for connection (pool busy) - batch size: {len(node_ids)}")
 
                     # Query neighbors for ALL nodes in batch at once (without embeddings for speed)
+                    # Convert string UUIDs to UUID type for faster matching
                     substep_start = time.time()
+                    uuid_array = [uuid.UUID(nid) for nid in node_ids]
                     all_neighbors = await conn.fetch(
                         """
                         SELECT ml.from_unit_id, ml.to_unit_id, ml.weight, ml.link_type, ml.entity_id,
@@ -745,27 +821,27 @@ class TemporalSemanticMemory:
                                mu.id as neighbor_id
                         FROM memory_links ml
                         JOIN memory_units mu ON ml.to_unit_id = mu.id
-                        WHERE ml.from_unit_id::text = ANY($1)
+                        WHERE ml.from_unit_id = ANY($1::uuid[])
                           AND ml.weight >= 0.1
                         ORDER BY ml.from_unit_id, ml.weight DESC
                         """,
-                        node_ids
+                        uuid_array
                     )
                     neighbor_query_time = time.time() - substep_start
                     if neighbor_query_time > 1.0:  # Log slow neighbor queries
-                        print(f"      [3.3.3] Slow NEIGHBOR query: {neighbor_query_time:.3f}s for {len(node_ids)} nodes → {len(all_neighbors)} neighbors")
+                        log_buffer.append(f"      [3.3.3] Slow NEIGHBOR query: {neighbor_query_time:.3f}s for {len(node_ids)} nodes → {len(all_neighbors)} neighbors")
                     query_neighbors_time += neighbor_query_time
 
                     # Fetch embeddings for current batch nodes (needed for weight calculation)
                     substep_start = time.time()
                     embeddings = await conn.fetch(
-                        "SELECT id, embedding FROM memory_units WHERE id::text = ANY($1)",
-                        node_ids
+                        "SELECT id, embedding FROM memory_units WHERE id = ANY($1::uuid[])",
+                        uuid_array
                     )
                     embedding_map = {str(row["id"]): row["embedding"] for row in embeddings}
                     fetch_embeddings_time = time.time() - substep_start
                     if fetch_embeddings_time > 0.5:
-                        print(f"      [3.3.4] Slow EMBEDDING fetch: {fetch_embeddings_time:.3f}s for {len(node_ids)} nodes")
+                        log_buffer.append(f"      [3.3.4] Slow EMBEDDING fetch: {fetch_embeddings_time:.3f}s for {len(node_ids)} nodes")
                     query_neighbors_time += fetch_embeddings_time
 
                 # Group neighbors by from_unit_id (in-memory, no DB)
@@ -851,48 +927,89 @@ class TemporalSemanticMemory:
                         "semantic_similarity": semantic_similarity,
                         "recency": recency_weight,
                         "frequency": frequency_weight,
+                        "embedding": memory_embedding,  # Store for MMR
                     })
 
                     # Spread to neighbors (from batch query results)
                     neighbors = neighbors_by_node.get(unit_id, [])
+
+                    # Group neighbors by to_unit_id to handle multiple connections
+                    neighbors_grouped = {}
                     for neighbor in neighbors:
                         neighbor_id = str(neighbor["to_unit_id"])
-                        link_weight = neighbor["weight"]
-                        link_type = neighbor["link_type"]
-                        entity_id = str(neighbor["entity_id"]) if neighbor["entity_id"] else None
-                        new_activation = activation * link_weight * 0.8  # 0.8 = decay factor
+                        if neighbor_id not in neighbors_grouped:
+                            neighbors_grouped[neighbor_id] = []
+                        neighbors_grouped[neighbor_id].append(neighbor)
 
-                        if neighbor_id not in visited:
-                            if new_activation > 0.1:
-                                queue.append(({
-                                    "id": neighbor["to_unit_id"],
-                                    "text": neighbor["text"],
-                                    "context": neighbor.get("context", ""),
-                                    "event_date": neighbor["event_date"],
-                                    "access_count": neighbor["access_count"],
-                                }, new_activation, False, unit_id, link_type, link_weight))  # parent_id, link_type, link_weight
+                    # Process each unique neighbor (aggregating multiple links)
+                    for neighbor_id, neighbor_links in neighbors_grouped.items():
+                        if neighbor_id in visited:
+                            continue
 
-                                if tracer:
-                                    tracer.add_neighbor_link(
-                                        from_node_id=unit_id,
-                                        to_node_id=neighbor_id,
-                                        link_type=link_type,
-                                        link_weight=link_weight,
-                                        entity_id=entity_id,
-                                        new_activation=new_activation,
-                                        followed=True
-                                    )
-                            elif tracer:
+                        # Sort links by weight descending to identify primary link
+                        neighbor_links_sorted = sorted(neighbor_links, key=lambda x: x["weight"], reverse=True)
+                        primary_link = neighbor_links_sorted[0]
+
+                        # Aggregate link weights: max + 30% bonus for additional links
+                        max_weight = primary_link["weight"]
+                        bonus_weight = sum(link["weight"] for link in neighbor_links_sorted[1:]) * 0.3
+                        combined_weight = max_weight + bonus_weight
+
+                        # Calculate new activation using combined weight
+                        new_activation = activation * combined_weight * 0.8  # 0.8 = decay factor
+
+                        # Use primary link metadata for queue and trace
+                        primary_link_type = primary_link["link_type"]
+                        primary_entity_id = str(primary_link["entity_id"]) if primary_link["entity_id"] else None
+
+                        if new_activation > 0.1:
+                            queue.append(({
+                                "id": primary_link["to_unit_id"],
+                                "text": primary_link["text"],
+                                "context": primary_link.get("context", ""),
+                                "event_date": primary_link["event_date"],
+                                "access_count": primary_link["access_count"],
+                            }, new_activation, False, unit_id, primary_link_type, combined_weight))  # parent_id, link_type, combined_weight
+
+                            # Record all links in trace (primary + additional)
+                            if tracer:
+                                # Add primary link with combined activation
                                 tracer.add_neighbor_link(
                                     from_node_id=unit_id,
                                     to_node_id=neighbor_id,
-                                    link_type=link_type,
-                                    link_weight=link_weight,
-                                    entity_id=entity_id,
+                                    link_type=primary_link_type,
+                                    link_weight=combined_weight,
+                                    entity_id=primary_entity_id,
                                     new_activation=new_activation,
-                                    followed=False,
-                                    prune_reason="activation_too_low"
+                                    followed=True
                                 )
+
+                                # Add additional links as supplementary (if multiple connections exist)
+                                for additional_link in neighbor_links_sorted[1:]:
+                                    additional_link_type = additional_link["link_type"]
+                                    additional_entity_id = str(additional_link["entity_id"]) if additional_link["entity_id"] else None
+                                    tracer.add_neighbor_link(
+                                        from_node_id=unit_id,
+                                        to_node_id=neighbor_id,
+                                        link_type=additional_link_type,
+                                        link_weight=additional_link["weight"],
+                                        entity_id=additional_entity_id,
+                                        new_activation=None,  # Don't show activation for supplementary links
+                                        followed=True,
+                                        is_supplementary=True  # Mark as supplementary link
+                                    )
+                        elif tracer:
+                            # Record pruned link
+                            tracer.add_neighbor_link(
+                                from_node_id=unit_id,
+                                to_node_id=neighbor_id,
+                                link_type=primary_link_type,
+                                link_weight=combined_weight,
+                                entity_id=primary_entity_id,
+                                new_activation=new_activation,
+                                followed=False,
+                                prune_reason="activation_too_low"
+                            )
 
                 calculate_weight_time += time.time() - substep_start
                 process_neighbors_time += time.time() - substep_start
@@ -902,10 +1019,10 @@ class TemporalSemanticMemory:
 
             spreading_activation_time = time.time() - step_start
             num_batches = (len(visited) + BATCH_SIZE - 1) // BATCH_SIZE  # Ceiling division
-            print(f"  [3] Spreading activation: {len(visited)} nodes visited in {spreading_activation_time:.3f}s")
-            print(f"      [3.1] Calculate weights: {calculate_weight_time:.3f}s")
-            print(f"      [3.2] Query neighbors: {query_neighbors_time:.3f}s ({num_batches} batched queries)")
-            print(f"      [3.3] Process neighbors: {process_neighbors_time:.3f}s")
+            log_buffer.append(f"  [3] Spreading activation: {len(visited)} nodes visited in {spreading_activation_time:.3f}s")
+            log_buffer.append(f"      [3.1] Calculate weights: {calculate_weight_time:.3f}s")
+            log_buffer.append(f"      [3.2] Query neighbors: {query_neighbors_time:.3f}s ({num_batches} batched queries)")
+            log_buffer.append(f"      [3.3] Process neighbors: {process_neighbors_time:.3f}s")
 
             if tracer:
                 tracer.add_phase_metric("spreading_activation", spreading_activation_time, {
@@ -916,15 +1033,33 @@ class TemporalSemanticMemory:
             # Step 4: Queue access count updates (background worker will process them)
             if visited_node_ids:
                 await self._access_count_queue.put(visited_node_ids)
-                print(f"  [4] Queued access count updates for {len(visited_node_ids)} nodes")
+                log_buffer.append(f"  [4] Queued access count updates for {len(visited_node_ids)} nodes")
 
-            # Step 5: Sort by final weight and return top results
+            # Step 5: Sort by final weight and apply MMR for diversity
             step_start = time.time()
             results.sort(key=lambda x: x["weight"], reverse=True)
-            top_results = results[:top_k]
-            print(f"  [5] Sort and return top {top_k}: {time.time() - step_start:.3f}s")
 
-            print(f"[SEARCH] Complete: {len(top_results)} results in {time.time() - search_start:.3f}s\n")
+            # Apply MMR (Maximal Marginal Relevance) for diversity if lambda < 1.0
+            if mmr_lambda < 1.0 and len(results) > top_k:
+                top_results = self._apply_mmr(results, top_k, mmr_lambda, log_buffer)
+                log_buffer.append(f"  [5] MMR diversification (λ={mmr_lambda}): {time.time() - step_start:.3f}s")
+            else:
+                top_results = results[:top_k]
+                # Add original rank and remove embeddings from results
+                for idx, result in enumerate(top_results):
+                    result["original_rank"] = idx + 1
+                    result["mmr_score"] = None
+                    result["mmr_relevance"] = None
+                    result["mmr_max_similarity"] = None
+                    result["mmr_diversified"] = False
+                    result.pop("embedding", None)
+                log_buffer.append(f"  [5] Sort and return top {top_k} (no MMR): {time.time() - step_start:.3f}s")
+
+            total_time = time.time() - search_start
+            log_buffer.append(f"[SEARCH {search_id}] Complete: {len(top_results)} results in {total_time:.3f}s")
+
+            # Log all buffered logs at once
+            logger.info("\n" + "\n".join(log_buffer))
 
             # Finalize trace if enabled
             if tracer:
@@ -933,8 +1068,206 @@ class TemporalSemanticMemory:
             return top_results, None
 
         except Exception as e:
-            print(f"[SEARCH] ERROR after {time.time() - search_start:.3f}s: {str(e)}")
+            log_buffer.append(f"[SEARCH {search_id}] ERROR after {time.time() - search_start:.3f}s: {str(e)}")
+            logger.error("\n" + "\n".join(log_buffer))
             raise Exception(f"Failed to search memories: {str(e)}")
+
+    def _apply_mmr(
+        self,
+        results: List[Dict[str, Any]],
+        top_k: int,
+        mmr_lambda: float,
+        log_buffer: List[str]
+    ) -> List[Dict[str, Any]]:
+        """
+        Apply Maximal Marginal Relevance (MMR) to diversify search results.
+
+        MMR balances relevance with diversity by selecting results that are:
+        1. Relevant to the query (high score)
+        2. Different from already selected results (low similarity)
+
+        Formula: MMR = λ * relevance - (1-λ) * max_similarity_to_selected
+
+        Args:
+            results: Sorted list of all results with embeddings
+            top_k: Number of results to select
+            mmr_lambda: Balance parameter (0=max diversity, 1=max relevance)
+            log_buffer: Logging buffer
+
+        Returns:
+            Diversified list of top_k results
+        """
+        if not results or top_k <= 0:
+            return []
+
+        # Normalize weights to [0, 1] for fair comparison with similarity
+        max_weight = max(r["weight"] for r in results)
+        min_weight = min(r["weight"] for r in results)
+        weight_range = max_weight - min_weight if max_weight > min_weight else 1.0
+
+        # Pre-compute normalized relevance scores for all results
+        for idx, result in enumerate(results):
+            result["original_rank"] = idx + 1
+            result["normalized_relevance"] = (result["weight"] - min_weight) / weight_range
+
+        # Extract embeddings as a numpy array for vectorized operations
+        # Shape: (num_results, embedding_dim)
+        embeddings_list = []
+        valid_indices = []
+        for idx, result in enumerate(results):
+            if result.get("embedding") is not None:
+                embeddings_list.append(result["embedding"])
+                valid_indices.append(idx)
+
+        if not embeddings_list:
+            # No embeddings available, just return top-k by relevance
+            return results[:top_k]
+
+        # Stack embeddings into a matrix (num_results, embedding_dim)
+        embeddings_matrix = np.array(embeddings_list, dtype=np.float32)
+
+        # Normalize embeddings for faster cosine similarity (just dot product after normalization)
+        norms = np.linalg.norm(embeddings_matrix, axis=1, keepdims=True)
+        norms[norms == 0] = 1.0  # Avoid division by zero
+        embeddings_matrix = embeddings_matrix / norms
+
+        selected_indices = []
+        remaining_indices = list(range(len(results)))
+        diversified_count = 0
+
+        for selection_round in range(min(top_k, len(results))):
+            if not remaining_indices:
+                break
+
+            best_mmr_score = float('-inf')
+            best_remaining_idx = 0
+
+            # Vectorized computation for all remaining candidates
+            for remaining_idx, candidate_idx in enumerate(remaining_indices):
+                candidate = results[candidate_idx]
+                normalized_relevance = candidate["normalized_relevance"]
+
+                # Calculate max similarity to selected results
+                max_similarity = 0.0
+                if selected_indices and candidate_idx in valid_indices:
+                    # Find position in embeddings_matrix
+                    embedding_idx = valid_indices.index(candidate_idx)
+                    candidate_embedding = embeddings_matrix[embedding_idx]
+
+                    # Vectorized similarity calculation with all selected embeddings
+                    if selected_indices:
+                        selected_embedding_indices = [valid_indices.index(idx) for idx in selected_indices if idx in valid_indices]
+                        if selected_embedding_indices:
+                            selected_embeddings = embeddings_matrix[selected_embedding_indices]
+                            # Compute cosine similarities in one operation (already normalized, so just dot product)
+                            similarities = np.dot(selected_embeddings, candidate_embedding)
+                            max_similarity = float(np.max(similarities))
+
+                # MMR score: balance relevance and diversity
+                mmr_score = mmr_lambda * normalized_relevance - (1 - mmr_lambda) * max_similarity
+
+                if mmr_score > best_mmr_score:
+                    best_mmr_score = mmr_score
+                    best_remaining_idx = remaining_idx
+                    best_max_similarity = max_similarity
+
+            # Select the best candidate
+            best_candidate_idx = remaining_indices.pop(best_remaining_idx)
+            best_candidate = results[best_candidate_idx]
+
+            # Store MMR metadata
+            best_candidate["mmr_score"] = best_mmr_score
+            best_candidate["mmr_relevance"] = best_candidate["normalized_relevance"]
+            best_candidate["mmr_max_similarity"] = best_max_similarity
+            best_candidate["mmr_diversified"] = best_remaining_idx > 0
+
+            selected_indices.append(best_candidate_idx)
+
+            if best_remaining_idx > 0:
+                diversified_count += 1
+
+        log_buffer.append(f"      MMR: Selected {len(selected_indices)} results, {diversified_count} diversified picks")
+
+        # Return selected results in order
+        selected_results = [results[idx] for idx in selected_indices]
+
+        # Remove embeddings from final results (not needed in response)
+        for result in selected_results:
+            result.pop("embedding", None)
+            result.pop("normalized_relevance", None)  # Clean up temp field
+
+        return selected_results
+
+    async def get_document(self, document_id: str, agent_id: str) -> Optional[Dict[str, Any]]:
+        """
+        Retrieve document metadata and statistics.
+
+        Args:
+            document_id: Document ID to retrieve
+            agent_id: Agent ID that owns the document
+
+        Returns:
+            Dictionary with document info or None if not found
+        """
+        pool = await self._get_pool()
+        async with pool.acquire() as conn:
+            doc = await conn.fetchrow(
+                """
+                SELECT d.id, d.agent_id, d.original_text, d.content_hash, d.metadata,
+                       d.created_at, d.updated_at, COUNT(mu.id) as unit_count
+                FROM documents d
+                LEFT JOIN memory_units mu ON mu.document_id = d.id
+                WHERE d.id = $1 AND d.agent_id = $2
+                GROUP BY d.id, d.agent_id, d.original_text, d.content_hash, d.metadata, d.created_at, d.updated_at
+                """,
+                document_id, agent_id
+            )
+
+            if not doc:
+                return None
+
+            import json
+            return {
+                "id": doc["id"],
+                "agent_id": doc["agent_id"],
+                "original_text": doc["original_text"],
+                "content_hash": doc["content_hash"],
+                "metadata": json.loads(doc["metadata"]) if doc["metadata"] else {},
+                "unit_count": doc["unit_count"],
+                "created_at": doc["created_at"],
+                "updated_at": doc["updated_at"]
+            }
+
+    async def delete_document(self, document_id: str, agent_id: str) -> Dict[str, int]:
+        """
+        Delete a document and all its associated memory units and links.
+
+        Args:
+            document_id: Document ID to delete
+            agent_id: Agent ID that owns the document
+
+        Returns:
+            Dictionary with counts of deleted items
+        """
+        pool = await self._get_pool()
+        async with pool.acquire() as conn:
+            async with conn.transaction():
+                # Count units before deletion
+                units_count = await conn.fetchval(
+                    "SELECT COUNT(*) FROM memory_units WHERE document_id = $1",
+                    document_id
+                )
+
+                # Delete document (cascades to memory_units and all their links)
+                deleted = await conn.fetchval(
+                    "DELETE FROM documents WHERE id = $1 AND agent_id = $2 RETURNING id",
+                    document_id, agent_id
+                )
+
+                return {
+                    "document_deleted": 1 if deleted else 0,
+                    "memory_units_deleted": units_count if deleted else 0
+                }
 
     async def delete_agent(self, agent_id: str) -> Dict[str, int]:
         """
@@ -984,23 +1317,33 @@ class TemporalSemanticMemory:
         sentences: List[str],
         context: str,
         fact_dates: List,
+        llm_entities: List[List[Dict]],  # NEW: Entities from LLM
     ) -> List[tuple]:
         """
-        Extract entities from ALL sentences in one batch (MUCH faster than sequential).
+        Process LLM-extracted entities for ALL facts in batch.
 
-        Uses spaCy's batch processing to extract entities from all texts at once,
-        then resolves and links them in bulk.
+        Uses entities provided by the LLM (no spaCy needed), then resolves
+        and links them in bulk.
 
         Returns list of tuples for batch insertion: (from_unit_id, to_unit_id, link_type, weight, entity_id)
         """
-        from .entity_resolver import extract_entities_batch
-
         try:
-            # Step 1: Extract entities from ALL sentences in one batch (fast!)
+            # Step 1: Convert LLM entities to the format expected by entity resolver
             substep_start = time.time()
-            all_entities = extract_entities_batch(sentences)
+            all_entities = []
+            for entity_list in llm_entities:
+                # Convert List[Entity] or List[dict] to List[Dict] format
+                formatted_entities = []
+                for ent in entity_list:
+                    # Handle both Entity objects and dicts
+                    if hasattr(ent, 'text'):
+                        formatted_entities.append({'text': ent.text, 'type': ent.type})
+                    elif isinstance(ent, dict):
+                        formatted_entities.append({'text': ent.get('text', ''), 'type': ent.get('type', 'CONCEPT')})
+                all_entities.append(formatted_entities)
+
             total_entities = sum(len(ents) for ents in all_entities)
-            print(f"  [6.1] spaCy NER (batch): {total_entities} entities from {len(sentences)} sentences in {time.time() - substep_start:.3f}s")
+            logger.debug(f"  [6.1] Process LLM entities: {total_entities} entities from {len(sentences)} facts in {time.time() - substep_start:.3f}s")
 
             # Step 2: Resolve entities in BATCH (much faster!)
             substep_start = time.time()
@@ -1022,7 +1365,7 @@ class TemporalSemanticMemory:
                         'nearby_entities': entities,
                     })
                     entity_to_unit.append((unit_id, local_idx, fact_date))
-            print(f"    [6.2.1] Prepare entities: {len(all_entities_flat)} entities in {time.time() - substep_6_2_1_start:.3f}s")
+            logger.debug(f"    [6.2.1] Prepare entities: {len(all_entities_flat)} entities in {time.time() - substep_6_2_1_start:.3f}s")
 
             # Resolve ALL entities in one batch call
             if all_entities_flat:
@@ -1052,7 +1395,7 @@ class TemporalSemanticMemory:
 
                     for idx, entity_id in zip(indices, batch_resolved):
                         resolved_entity_ids[idx] = entity_id
-                print(f"    [6.2.2] Resolve entities: {len(all_entities_flat)} entities in {time.time() - substep_6_2_2_start:.3f}s")
+                logger.debug(f"    [6.2.2] Resolve entities: {len(all_entities_flat)} entities in {time.time() - substep_6_2_2_start:.3f}s")
 
                 # [6.2.3] Create unit-entity links in BATCH
                 substep_6_2_3_start = time.time()
@@ -1069,12 +1412,12 @@ class TemporalSemanticMemory:
 
                 # Batch insert all unit-entity links (MUCH faster!)
                 await self.entity_resolver.link_units_to_entities_batch(unit_entity_pairs, conn=conn)
-                print(f"    [6.2.3] Create unit-entity links (batched): {len(unit_entity_pairs)} links in {time.time() - substep_6_2_3_start:.3f}s")
+                logger.debug(f"    [6.2.3] Create unit-entity links (batched): {len(unit_entity_pairs)} links in {time.time() - substep_6_2_3_start:.3f}s")
 
-                print(f"  [6.2] Entity resolution (batched): {len(all_entities_flat)} entities resolved in {time.time() - step_6_2_start:.3f}s")
+                logger.debug(f"  [6.2] Entity resolution (batched): {len(all_entities_flat)} entities resolved in {time.time() - step_6_2_start:.3f}s")
             else:
                 unit_to_entity_ids = {}
-                print(f"  [6.2] Entity resolution (batched): 0 entities in {time.time() - step_6_2_start:.3f}s")
+                logger.debug(f"  [6.2] Entity resolution (batched): 0 entities in {time.time() - step_6_2_start:.3f}s")
 
             # Step 3: Create entity links between units that share entities
             substep_start = time.time()
@@ -1106,12 +1449,12 @@ class TemporalSemanticMemory:
                         links.append((unit_id_1, unit_id_2, 'entity', 1.0, entity_id))
                         links.append((unit_id_2, unit_id_1, 'entity', 1.0, entity_id))
 
-            print(f"  [6.3] Entity link creation: {len(links)} links for {len(all_entity_ids)} unique entities in {time.time() - substep_start:.3f}s")
+            logger.debug(f"  [6.3] Entity link creation: {len(links)} links for {len(all_entity_ids)} unique entities in {time.time() - substep_start:.3f}s")
 
             return links
 
         except Exception as e:
-            print(f"ERROR: Failed to extract entities in batch: {str(e)}")
+            logger.error(f" Failed to extract entities in batch: {str(e)}")
             import traceback
             traceback.print_exc()
             # Re-raise to trigger rollback at put_async level
@@ -1184,7 +1527,7 @@ class TemporalSemanticMemory:
                 )
 
         except Exception as e:
-            print(f"ERROR: Failed to create temporal links: {str(e)}")
+            logger.error(f" Failed to create temporal links: {str(e)}")
             import traceback
             traceback.print_exc()
             # Re-raise to trigger rollback at put_async level
@@ -1244,7 +1587,7 @@ class TemporalSemanticMemory:
                 )
 
         except Exception as e:
-            print(f"ERROR: Failed to create semantic links: {str(e)}")
+            logger.error(f" Failed to create semantic links: {str(e)}")
             import traceback
             traceback.print_exc()
             # Re-raise to trigger rollback at put_async level
@@ -1265,4 +1608,4 @@ class TemporalSemanticMemory:
                 links
             )
         except Exception as e:
-            print(f"Warning: Failed to insert entity links: {str(e)}")
+            logger.warning(f" Failed to insert entity links: {str(e)}")

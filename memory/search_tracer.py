@@ -182,9 +182,10 @@ class SearchTracer:
         link_type: Literal["temporal", "semantic", "entity"],
         link_weight: float,
         entity_id: Optional[str],
-        new_activation: float,
+        new_activation: Optional[float],
         followed: bool,
         prune_reason: Optional[str] = None,
+        is_supplementary: bool = False,
     ):
         """
         Record a link to a neighbor (whether followed or not).
@@ -195,9 +196,10 @@ class SearchTracer:
             link_type: Type of link
             link_weight: Weight of link
             entity_id: Entity ID if link is entity-based
-            new_activation: Activation passed to neighbor
+            new_activation: Activation passed to neighbor (None for supplementary links)
             followed: Whether link was followed
             prune_reason: Why link was not followed (if not followed)
+            is_supplementary: Whether this is a supplementary link (multiple connections)
         """
         # Find the visit for the source node
         visit = None
@@ -218,6 +220,7 @@ class SearchTracer:
             new_activation=new_activation,
             followed=followed,
             prune_reason=prune_reason,
+            is_supplementary=is_supplementary,
         )
 
         visit.neighbors_explored.append(link_info)

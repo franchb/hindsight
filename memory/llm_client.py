@@ -13,6 +13,16 @@ from openai import AsyncOpenAI
 from pydantic import BaseModel, Field
 
 
+class Entity(BaseModel):
+    """An entity extracted from text."""
+    text: str = Field(
+        description="The entity name as it appears in the fact"
+    )
+    type: Literal["PERSON", "ORG", "PLACE", "PRODUCT", "CONCEPT"] = Field(
+        description="Entity type: PERSON, ORG, PLACE, PRODUCT, or CONCEPT"
+    )
+
+
 class ExtractedFact(BaseModel):
     """A single extracted fact from text."""
     fact: str = Field(
@@ -20,6 +30,10 @@ class ExtractedFact(BaseModel):
     )
     date: str = Field(
         description="Absolute date/time when this fact occurred in ISO format (YYYY-MM-DDTHH:MM:SSZ). If text mentions relative time (yesterday, last week, this morning), calculate absolute date from the provided context date."
+    )
+    entities: List[Entity] = Field(
+        default_factory=list,
+        description="List of important entities mentioned in this fact with their types"
     )
 
 
@@ -132,10 +146,20 @@ async def _extract_facts_from_chunk(
 Each fact should:
 1. Be SELF-CONTAINED - readable without the original context
 2. Include ALL relevant details: WHO, WHAT, WHERE, WHEN, WHY, HOW
-3. Preserve specific names, dates, numbers, locations, relationships
-4. Resolve pronouns to actual names/entities
-5. Include surrounding context that makes the fact meaningful
-6. Capture nuances, reasons, causes, and implications
+3. **CRITICAL: ALWAYS include the SUBJECT (who is doing/saying/experiencing)**
+4. Preserve specific names, dates, numbers, locations, relationships
+5. Resolve pronouns to actual names/entities (I → speaker name, their → possessor name)
+6. **CRITICAL: Preserve possessive relationships** (their kids → whose kids, his car → whose car)
+7. Include surrounding context that makes the fact meaningful
+8. Capture nuances, reasons, causes, and implications
+
+**COMMON MISTAKES TO AVOID:**
+- ❌ "The kids were excited" → Missing WHO the kids belong to
+- ✅ "Melanie's kids were excited" or "Melanie took her kids who were excited"
+- ❌ "Someone went hiking" → Missing WHO
+- ✅ "Bob went hiking"
+- ❌ "The car broke down" → Missing whose car
+- ✅ "Alice's car broke down"
 
 ## TEMPORAL INFORMATION (VERY IMPORTANT)
 For each fact, extract the ABSOLUTE date/time when it occurred:
@@ -153,7 +177,12 @@ Examples of date extraction:
 - "I work at Google" (no time mentioned) → date: 2024-03-20T10:00:00Z (use reference)
 
 ## What to EXTRACT (BE EXHAUSTIVE - DO NOT SKIP ANYTHING):
-- **Biographical information**: jobs, roles, backgrounds, experiences, skills
+- **Biographical information (CRITICAL - NEVER MISS)**:
+  - Origins: home country, birthplace, where someone is from ("my home country Sweden" = Caroline is from Sweden)
+  - Current location: where they live now
+  - Jobs, roles, backgrounds, experiences, skills
+  - Family background, heritage, cultural identity
+  - Education, training, certifications
 - **Events (NEVER MISS THESE)**:
   - ANY action that happened (went, did, attended, joined, started, finished, etc.)
   - Photos, images, videos shared or taken ("here's a photo", "took a picture", "captured")
@@ -161,6 +190,10 @@ Examples of date extraction:
   - Achievements, milestones, accomplishments
   - Travels, visits, locations visited
   - Purchases, acquisitions, creations
+- **Identity and personal details**:
+  - Origins, nationality, home country, roots
+  - Cultural background, heritage
+  - Family connections (grandmother from X, parents in Y)
 - **Opinions and beliefs**: who believes what and why
 - **Recommendations and advice**: specific suggestions with reasoning
 - **Descriptions**: detailed explanations of how things work
@@ -179,24 +212,89 @@ Examples of date extraction:
 - Pure reactions without content ("wow", "cool", "nice")
 - Incomplete thoughts or sentence fragments with no meaning
 
+## ENTITY EXTRACTION (CRITICAL):
+For EACH fact, extract ALL important entities mentioned with their types:
+- **PERSON**: Names of individuals (Alice, Bob, Dr. Smith)
+- **ORG**: Companies, institutions, teams (Google, MIT, AI Team)
+- **PLACE**: Cities, countries, locations, venues (Mountain View, Yosemite, The Coffee Shop)
+- **PRODUCT**: Specific products, tools, technologies (iPhone, Python, TensorFlow)
+- **CONCEPT**: Important topics, projects, subjects (AI, machine learning, Project Phoenix)
+
+Entity extraction rules:
+- Use the EXACT form as it appears in the fact (preserve capitalization)
+- Assign the correct type to distinguish ambiguous entities (Apple the company = ORG, apple the fruit = PRODUCT/CONCEPT)
+- Include both full names and commonly used short forms if both appear
+- Extract proper nouns and key identifying terms
+- Skip generic terms (the, a, some) and pronouns (he, she, they)
+- Each entity must have both text and type
+
 ## EXAMPLES of GOOD facts (detailed, comprehensive):
 
 Input: "Alice mentioned she works at Google in Mountain View. She joined the AI team last year."
 GOOD fact: "Alice works at Google in Mountain View on the AI team, which she joined last year"
 GOOD date: Calculate based on reference date (if reference is 2024-03-20, "last year" = 2023-03-20)
+GOOD entities: [
+  {{"text": "Alice", "type": "PERSON"}},
+  {{"text": "Google", "type": "ORG"}},
+  {{"text": "Mountain View", "type": "PLACE"}},
+  {{"text": "AI team", "type": "ORG"}}
+]
 
 Input: "Yesterday Bob went hiking in Yosemite because it helps him clear his mind."
 GOOD fact: "Bob went hiking in Yosemite because it helps him clear his mind"
 GOOD date: Reference date minus 1 day
+GOOD entities: [
+  {{"text": "Bob", "type": "PERSON"}},
+  {{"text": "Yosemite", "type": "PLACE"}}
+]
 
 Input: "Here's a photo of me with my friends taken last week at the beach."
 GOOD fact: "Someone shared/took a photo with their friends at the beach"
 GOOD date: Reference date minus 7 days (last week)
+GOOD entities: []
 NOTE: Extract the event (photo taken/shared with friends at beach), NOT just that a photo exists
 
 Input: "I sent you that article about AI last Tuesday."
 GOOD fact: "Someone sent an article about AI"
 GOOD date: Calculate last Tuesday from reference date
+GOOD entities: [
+  {{"text": "AI", "type": "CONCEPT"}}
+]
+
+Input: "I bought an Apple laptop and some apples from the store."
+GOOD fact: "Someone bought an Apple laptop and some apples from the store"
+GOOD entities: [
+  {{"text": "Apple", "type": "ORG"}},
+  {{"text": "apples", "type": "PRODUCT"}}
+]
+NOTE: Use type to distinguish "Apple" the company from "apples" the fruit
+
+Input: "Melanie said 'Yesterday I took the kids to the museum - it was so cool seeing their eyes light up!'"
+BAD fact: "The kids were excited about the museum"
+BAD entities: [{{"text": "museum", "type": "PLACE"}}]
+PROBLEM: Missing WHO (Melanie) and whose kids!
+
+GOOD fact: "Melanie took her kids to the museum yesterday and they were excited, with their eyes lighting up"
+GOOD date: Reference date minus 1 day
+GOOD entities: [
+  {{"text": "Melanie", "type": "PERSON"}},
+  {{"text": "museum", "type": "PLACE"}}
+]
+NOTE: Preserved the subject (Melanie) and possessive relationship (her kids)
+
+Input: "Caroline said 'This necklace is from my grandma in my home country, Sweden. She gave it to me when I was young.'"
+BAD fact: "Caroline received a necklace as a gift from her grandmother when she was young"
+BAD entities: [{{"text": "Caroline", "type": "PERSON"}}, {{"text": "necklace", "type": "PRODUCT"}}]
+PROBLEM: Missing the CRITICAL biographical info that Caroline is from Sweden!
+
+GOOD facts (extract MULTIPLE facts):
+1. "Caroline is from Sweden, which is her home country"
+   entities: [{{"text": "Caroline", "type": "PERSON"}}, {{"text": "Sweden", "type": "PLACE"}}]
+2. "Caroline's grandmother is from Sweden"
+   entities: [{{"text": "Caroline", "type": "PERSON"}}, {{"text": "Sweden", "type": "PLACE"}}]
+3. "Caroline received a necklace as a gift from her grandmother in Sweden when she was young"
+   entities: [{{"text": "Caroline", "type": "PERSON"}}, {{"text": "Sweden", "type": "PLACE"}}, {{"text": "necklace", "type": "PRODUCT"}}]
+NOTE: Extract SEPARATE facts for biographical details (home country) AND events (gift received)
 
 ## TEXT TO EXTRACT FROM:
 {chunk}
@@ -204,16 +302,21 @@ GOOD date: Calculate last Tuesday from reference date
 Remember:
 1. BE EXHAUSTIVE - Extract EVERY event, action, and fact mentioned
 2. DO NOT skip casual mentions like "here's a photo", "I was with X", "sent you Y"
-3. Include ALL details, names, numbers, reasons, and context in the fact text
-4. Extract the absolute date for EACH fact by calculating relative times from the reference date
-5. When in doubt, EXTRACT IT - better to have too many facts than miss important events"""
+3. **ALWAYS include the SUBJECT** - never say "the kids" without saying whose kids
+4. **Preserve possessive relationships** - "their kids" must become "Person's kids"
+5. **Extract biographical details as SEPARATE facts** - "my home country Sweden" should create a fact "Person is from Sweden"
+6. Include ALL details, names, numbers, reasons, and context in the fact text
+7. Extract the absolute date for EACH fact by calculating relative times from the reference date
+8. Extract ALL entities with their types (PERSON, ORG, PLACE, PRODUCT, CONCEPT) for each fact
+9. Use types to disambiguate entities (Apple the company = ORG, apple the fruit = PRODUCT)
+10. When in doubt, EXTRACT IT - better to have too many facts than miss important events"""
 
     response = await client.beta.chat.completions.parse(
         model=model,
         messages=[
             {
                 "role": "system",
-                "content": "You are an EXHAUSTIVE fact extractor. Extract EVERY event, action, and fact mentioned - never skip anything. This includes casual mentions like photos shared, things sent, meetups, gatherings, or any action. Preserve all context, details, and nuances. Calculate absolute dates from relative time expressions. When in doubt, extract it - missing facts is worse than extracting too many."
+                "content": "You are an EXHAUSTIVE fact and entity extractor. CRITICAL RULES: 1) ALWAYS include the SUBJECT (never 'the kids' without whose kids), 2) Extract biographical details as SEPARATE facts (if someone mentions 'my home country Sweden', extract 'Person is from Sweden' as its own fact), 3) Extract EVERY event, action, and fact - never skip anything. For each fact, extract ALL important entities with their types: PERSON, ORG, PLACE, PRODUCT, CONCEPT. Use types to disambiguate (Apple=ORG vs apples=PRODUCT). Preserve possessive relationships (their→whose). Include casual mentions (photos, meetups). Calculate absolute dates from relative times. When in doubt, extract it - better too many facts than missing critical biographical/identity information."
             },
             {
                 "role": "user",

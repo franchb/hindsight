@@ -20,7 +20,10 @@ from typing import Optional
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from memory import TemporalSemanticMemory
 
+import logging
+
 load_dotenv()
+logging.basicConfig(level=logging.INFO)
 
 app = FastAPI(title="Memory Graph API", version="1.0.0")
 
@@ -34,6 +37,7 @@ class SearchRequest(BaseModel):
     agent_id: str = "default"
     thinking_budget: int = 100
     top_k: int = 10
+    mmr_lambda: float = 0.5
 
 
 async def get_graph_data():
@@ -208,7 +212,8 @@ async def api_search(request: SearchRequest):
             query=request.query,
             thinking_budget=request.thinking_budget,
             top_k=request.top_k,
-            enable_trace=True
+            enable_trace=True,
+            mmr_lambda=request.mmr_lambda
         )
 
         # Convert trace to dict
