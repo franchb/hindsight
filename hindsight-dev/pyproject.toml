@@ -91,3 +91,4 @@ unresolved-reference = "ignore"     # Forward references
 unresolved-import = "ignore"        # Dynamic imports
 invalid-assignment = "ignore"       # Intentional monkey-patching
 no-matching-overload = "ignore"     # Complex generic issues
+unresolved-attribute = "ignore"     # Optional types accessed after truthy checks

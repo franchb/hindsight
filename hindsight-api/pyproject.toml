@@ -182,3 +182,4 @@ invalid-key = "ignore"              # Pydantic ConfigDict not understood
 invalid-method-override = "ignore"  # Intentional signature differences
 unresolved-reference = "ignore"     # Forward references not always resolved
 unresolved-import = "ignore"        # Optional deps (torch, sentence_transformers) guarded by try/except
+unresolved-attribute = "ignore"     # Optional types accessed after truthy checks (upstream patterns)
