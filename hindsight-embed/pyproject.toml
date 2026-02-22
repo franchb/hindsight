@@ -28,7 +28,7 @@ dev = [
 
 [tool.ruff]
 line-length = 120
-target-version = "py311"
+target-version = "py314"
 exclude = [
     "tests/",
 ]
@@ -55,7 +55,7 @@ indent-style = "space"
 # Type checking configuration
 
 [tool.ty.environment]
-python-version = "3.11"
+python-version = "3.14"
 
 [tool.ty.rules]
 # Disable noisy rules while keeping important ones

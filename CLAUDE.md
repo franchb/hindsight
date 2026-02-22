@@ -9,6 +9,51 @@ Hindsight is an agent memory system that provides long-term memory for AI agents
 - **Experience facts**: Personal experiences ("I visited Paris in 2023")
 - **Mental models**: Consolidated knowledge synthesized from facts ("User prefers functional programming patterns")
 
+## Fork Context (franchb/hindsight)
+
+This is a fork of [vectorize-io/hindsight](https://github.com/vectorize-io/hindsight). It exists to bump the `litellm` dependency so DeepInfra embedding/reranker providers work correctly via `litellm-sdk`. Upstream pins an older litellm that lacks DeepInfra support.
+
+### Divergence from upstream
+
+- **CI**: Upstream has ~20 CI jobs using Vertex AI, Cohere, multi-platform builds, PyPI/npm publishing, Helm, Rust CLI builds, and GCP credentials. This fork replaces all of that with two minimal workflows (see below).
+- **Docker images**: Only slim variants are built (`INCLUDE_LOCAL_MODELS=false`), targeting `linux/amd64` only. Images are published to `ghcr.io/franchb/` (not upstream's registry).
+- **No PyPI/npm publishing**: This fork does not publish packages. Only Docker images are released.
+
+### CI workflows (`.github/workflows/`)
+
+**`ci.yml`** -- runs on push to `main` and PRs targeting `main`:
+| Job | What it does |
+|-----|-------------|
+| `lint` | Python 3.11 + Node 20. Runs `./scripts/hooks/lint.sh` (Ruff, ty, ESLint, Prettier) |
+| `unit-tests` | Pure unit tests only -- no LLM calls, no HuggingFace models, no DB. Explicit test file list. |
+| `build-api` | `uv build` in hindsight-api |
+| `build-docker-slim` | Matrix: `api-slim` + `standalone-slim`. Build-only, no push. Validates Dockerfile. |
+
+**`release.yml`** -- runs on `v*` tags:
+| Job | What it does |
+|-----|-------------|
+| `build-and-push-images` | Matrix: `hindsight-api` + `hindsight`. Slim only, `linux/amd64`, pushes to `ghcr.io/franchb/<image>`. Tags: `X.Y.Z-slim`, `X.Y-slim`, `X-slim`, `latest-slim`. |
+
+**No secrets required** beyond the automatic `GITHUB_TOKEN`. Future enhancement: add `OPENAI_API_KEY` and `DEEPINFRA_API_KEY` if smoke tests are needed.
+
+### Target deployment configuration
+
+```
+HINDSIGHT_API_LLM_PROVIDER=openai
+HINDSIGHT_API_EMBEDDINGS_PROVIDER=litellm-sdk
+HINDSIGHT_API_EMBEDDINGS_LITELLM_SDK_MODEL=deepinfra/BAAI/bge-small-en-v1.5
+HINDSIGHT_API_RERANKER_PROVIDER=litellm-sdk
+```
+
+### Syncing with upstream
+
+```bash
+git fetch upstream
+git merge upstream/main
+# Resolve conflicts, particularly in .github/workflows/ (keep our versions)
+# Re-run: ./scripts/hooks/lint.sh
+```
+
 ## Development Commands
 
 ### API Server (Python/FastAPI)
