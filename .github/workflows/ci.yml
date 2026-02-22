@@ -1,0 +1,141 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    env:
+      UV_INDEX: pytorch=https://download.pytorch.org/whl/cpu
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+
+    - name: Set up Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '20'
+        cache: 'npm'
+        cache-dependency-path: package-lock.json
+
+    - name: Install uv
+      uses: astral-sh/setup-uv@v5
+      with:
+        enable-cache: true
+
+    - name: Install Node dependencies
+      run: npm ci
+
+    - name: Install Python dependencies
+      run: |
+        cd hindsight-api && uv sync --frozen --index-strategy unsafe-best-match
+        cd ../hindsight-dev && uv sync --frozen --index-strategy unsafe-best-match
+        cd ../hindsight-embed && uv sync --frozen --index-strategy unsafe-best-match
+
+    - name: Run lint
+      run: ./scripts/hooks/lint.sh
+
+  unit-tests:
+    runs-on: ubuntu-latest
+    env:
+      UV_INDEX: pytorch=https://download.pytorch.org/whl/cpu
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+
+    - name: Install uv
+      uses: astral-sh/setup-uv@v5
+      with:
+        enable-cache: true
+
+    - name: Install dependencies
+      working-directory: ./hindsight-api
+      run: uv sync --frozen --no-install-project --index-strategy unsafe-best-match
+
+    - name: Run unit tests
+      working-directory: ./hindsight-api
+      run: |
+        uv run pytest \
+          tests/test_config_validation.py \
+          tests/test_chunking.py \
+          tests/test_query_analyzer.py \
+          tests/test_link_utils.py \
+          tests/test_sql_schema_safety.py \
+          tests/test_provider_default_models.py \
+          tests/test_main_module.py \
+          tests/test_server_module.py \
+          tests/test_litellm_sdk_embeddings.py \
+          tests/test_litellm_sdk_cross_encoder.py \
+          -v --timeout 120 -n auto --dist loadgroup
+
+  build-api:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+
+    - name: Install uv
+      uses: astral-sh/setup-uv@v5
+      with:
+        enable-cache: true
+
+    - name: Build hindsight-api
+      working-directory: ./hindsight-api
+      run: uv build
+
+  build-docker-slim:
+    name: Build Docker (${{ matrix.name }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - target: api-only
+            name: api-slim
+            build_args: |
+              INCLUDE_LOCAL_MODELS=false
+              PRELOAD_ML_MODELS=false
+          - target: standalone
+            name: standalone-slim
+            build_args: |
+              INCLUDE_LOCAL_MODELS=false
+              PRELOAD_ML_MODELS=false
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+
+    - name: Build ${{ matrix.name }} image
+      uses: docker/build-push-action@v6
+      with:
+        context: .
+        file: docker/standalone/Dockerfile
+        target: ${{ matrix.target }}
+        build-args: ${{ matrix.build_args }}
+        push: false
+        load: false
+        tags: hindsight-${{ matrix.name }}:test
