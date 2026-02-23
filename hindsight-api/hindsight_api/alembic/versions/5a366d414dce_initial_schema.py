@@ -82,26 +82,28 @@ def _detect_text_search_extension() -> str:
 
     if text_search_extension == "vchord":
         # Create vchord_bm25 extension if not exists
+        conn = op.get_bind()
         try:
+            conn.execute(text("SAVEPOINT create_ext_vchord_bm25"))
             op.execute("CREATE EXTENSION IF NOT EXISTS vchord_bm25 CASCADE")
+            conn.execute(text("RELEASE SAVEPOINT create_ext_vchord_bm25"))
         except Exception:
-            # Extension might already exist or user lacks permissions - verify it exists
-            conn = op.get_bind()
+            conn.execute(text("ROLLBACK TO SAVEPOINT create_ext_vchord_bm25"))
             result = conn.execute(text("SELECT 1 FROM pg_extension WHERE extname = 'vchord_bm25'")).fetchone()
             if not result:
-                # Extension truly doesn't exist - re-raise the error
                 raise
         return "vchord"
     elif text_search_extension == "pg_textsearch":
         # Create pg_textsearch extension if not exists
+        conn = op.get_bind()
         try:
+            conn.execute(text("SAVEPOINT create_ext_pg_textsearch"))
             op.execute("CREATE EXTENSION IF NOT EXISTS pg_textsearch CASCADE")
+            conn.execute(text("RELEASE SAVEPOINT create_ext_pg_textsearch"))
         except Exception:
-            # Extension might already exist or user lacks permissions - verify it exists
-            conn = op.get_bind()
+            conn.execute(text("ROLLBACK TO SAVEPOINT create_ext_pg_textsearch"))
             result = conn.execute(text("SELECT 1 FROM pg_extension WHERE extname = 'pg_textsearch'")).fetchone()
             if not result:
-                # Extension truly doesn't exist - re-raise the error
                 raise
         return "pg_textsearch"
     elif text_search_extension == "native":
@@ -121,14 +123,15 @@ def upgrade() -> None:
 
     # We keep this here as a fallback for backwards compatibility
     # This may fail if user lacks permissions, which is fine if extension already exists
+    conn = op.get_bind()
     try:
+        conn.execute(text("SAVEPOINT create_ext_vector"))
         op.execute("CREATE EXTENSION IF NOT EXISTS vector")
+        conn.execute(text("RELEASE SAVEPOINT create_ext_vector"))
     except Exception:
-        # Extension might already exist or user lacks permissions - verify it exists
-        conn = op.get_bind()
+        conn.execute(text("ROLLBACK TO SAVEPOINT create_ext_vector"))
         result = conn.execute(text("SELECT 1 FROM pg_extension WHERE extname = 'vector'")).fetchone()
         if not result:
-            # Extension truly doesn't exist - re-raise the error
             raise
 
     # Create banks table
