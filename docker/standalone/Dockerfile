@@ -166,11 +166,6 @@ RUN chown -R hindsight:hindsight /app
 
 USER hindsight
 
-# Create pg0 data directory as hindsight user so that Docker seeds new named
-# volumes with correct ownership (UID 1000) on first use, avoiding the
-# "Permission denied" error when mounting a fresh root-owned volume.
-RUN mkdir -p /home/hindsight/.pg0
-
 ENV PATH="/app/api/.venv/bin:${PATH}"
 
 # Pre-download tiktoken encoding (ALWAYS - required for token counting even in air-gapped envs)
@@ -321,11 +316,6 @@ RUN chmod +x /app/start-all.sh
 RUN chown -R hindsight:hindsight /app
 
 USER hindsight
-
-# Create pg0 data directory as hindsight user so that Docker seeds new named
-# volumes with correct ownership (UID 1000) on first use, avoiding the
-# "Permission denied" error when mounting a fresh root-owned volume.
-RUN mkdir -p /home/hindsight/.pg0
 
 ENV PATH="/app/api/.venv/bin:${PATH}"
 

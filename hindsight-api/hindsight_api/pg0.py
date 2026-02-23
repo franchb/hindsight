@@ -1,7 +1,10 @@
 import asyncio
 import logging
 
-from pg0 import Pg0
+try:
+    from pg0 import Pg0
+except ImportError:
+    Pg0 = None
 
 logger = logging.getLogger(__name__)
 
@@ -30,6 +33,11 @@ class EmbeddedPostgres:
         self._pg0: Pg0 | None = None
 
     def _get_pg0(self) -> Pg0:
+        if Pg0 is None:
+            raise RuntimeError(
+                "pg0-embedded is not installed. Set HINDSIGHT_API_DATABASE_URL "
+                "to a postgresql:// connection string for an external PostgreSQL server."
+            )
         if self._pg0 is None:
             kwargs = {
                 "name": self.name,
