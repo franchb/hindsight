@@ -45,10 +45,6 @@ dependencies = [
     "litellm>=1.0.0",
     "markitdown[pdf,docx,pptx,xlsx,xls]>=0.1.4",  # File to markdown conversion
     "obstore>=0.4.0",  # S3/GCS/Azure object storage client (Rust-backed)
-    # Local ML models for embeddings/reranking - can be excluded in Docker with INCLUDE_LOCAL_MODELS=false
-    "sentence-transformers>=3.3.0",
-    "transformers>=4.53.0", # Security fixes for ReDoS vulnerabilities
-    "torch>=2.6.0", # CVE fix for remote code execution
     "uvloop>=0.22.1",
     # Transitive dependency security fixes
     "pyasn1>=0.6.2", # DoS vulnerability fix
@@ -61,6 +57,11 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+local-models = [
+    "sentence-transformers>=3.3.0",
+    "transformers>=4.53.0",
+    "torch>=2.6.0",
+]
 test = [
     "pytest>=7.0.0",
     "pytest-asyncio>=0.21.0",
@@ -122,7 +123,7 @@ dev = [
 
 [tool.ruff]
 line-length = 120
-target-version = "py311"
+target-version = "py314"
 exclude = [
     "tests/",
     "**/tests/",
@@ -161,7 +162,7 @@ index-strategy = "unsafe-best-match"
 # ty is an extremely fast Python type checker from Astral (same team as ruff/uv)
 
 [tool.ty.environment]
-python-version = "3.11"
+python-version = "3.14"
 
 [tool.ty.src]
 exclude = [
@@ -180,3 +181,5 @@ call-non-callable = "ignore"        # False positives with Optional types
 invalid-key = "ignore"              # Pydantic ConfigDict not understood
 invalid-method-override = "ignore"  # Intentional signature differences
 unresolved-reference = "ignore"     # Forward references not always resolved
+unresolved-import = "ignore"        # Optional deps (torch, sentence_transformers) guarded by try/except
+unresolved-attribute = "ignore"     # Optional types accessed after truthy checks (upstream patterns)

@@ -45,7 +45,7 @@ dev = [
 
 [tool.ruff]
 line-length = 120
-target-version = "py311"
+target-version = "py314"
 
 [tool.ruff.lint]
 select = [
@@ -77,7 +77,7 @@ indent-style = "space"
 # ty is an extremely fast Python type checker from Astral (same team as ruff/uv)
 
 [tool.ty.environment]
-python-version = "3.11"
+python-version = "3.14"
 
 [tool.ty.rules]
 # Disable noisy rules
@@ -91,3 +91,4 @@ unresolved-reference = "ignore"     # Forward references
 unresolved-import = "ignore"        # Dynamic imports
 invalid-assignment = "ignore"       # Intentional monkey-patching
 no-matching-overload = "ignore"     # Complex generic issues
+unresolved-attribute = "ignore"     # Optional types accessed after truthy checks

@@ -25,7 +25,7 @@ ARG INCLUDE_LOCAL_MODELS=true
 # =============================================================================
 # Stage: API Builder
 # =============================================================================
-FROM python:3.11-slim AS api-builder
+FROM python:3.14-slim AS api-builder
 
 ARG INCLUDE_API
 ARG INCLUDE_LOCAL_MODELS
@@ -47,17 +47,13 @@ COPY hindsight-api/README.md ./api/
 
 WORKDIR /app/api
 
-# Remove local ML model dependencies if INCLUDE_LOCAL_MODELS=false
-# This creates a smaller image when using external providers (TEI, OpenAI, Cohere)
-RUN if [ "$INCLUDE_LOCAL_MODELS" != "true" ]; then \
-        echo "Removing local-models dependencies (sentence-transformers, torch, transformers)..." && \
-        sed -i '/"sentence-transformers/d' pyproject.toml && \
-        sed -i '/"transformers/d' pyproject.toml && \
-        sed -i '/"torch/d' pyproject.toml; \
+# Sync dependencies
+# When INCLUDE_LOCAL_MODELS=true, install the local-models extra (sentence-transformers, torch, transformers)
+RUN if [ "$INCLUDE_LOCAL_MODELS" = "true" ]; then \
+        uv sync --extra local-models; \
+    else \
+        uv sync; \
     fi
-
-# Sync dependencies (will create lock file if needed)
-RUN uv sync
 
 # Copy source code (alembic migrations are inside hindsight_api/)
 COPY hindsight-api/hindsight_api ./hindsight_api
@@ -141,7 +137,7 @@ RUN STANDALONE_ROOT=$(find .next/standalone -path '*/node_modules' -prune -o -na
 # =============================================================================
 # Stage: Final Image - API Only
 # =============================================================================
-FROM python:3.11-slim AS api-only
+FROM python:3.14-slim AS api-only
 
 WORKDIR /app
 
@@ -283,7 +279,7 @@ CMD ["/app/start-all.sh"]
 # =============================================================================
 # Stage: Final Image - Standalone (both API and Control Plane)
 # =============================================================================
-FROM python:3.11-slim AS standalone
+FROM python:3.14-slim AS standalone
 
 WORKDIR /app
 
