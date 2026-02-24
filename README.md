@@ -79,12 +79,38 @@ You can modify the LLM provider by setting `HINDSIGHT_API_LLM_PROVIDER`. Valid o
 export OPENAI_API_KEY=sk-xxx
 export HINDSIGHT_DB_PASSWORD=choose-a-password
 cd docker/docker-compose
-docker compose up 
+docker compose up
 ```
 
 
 >API: http://localhost:8888
 >UI: http://localhost:9999
+
+### Docker with VectorChord
+
+[VectorChord](https://github.com/tensorchord/VectorChord) provides high-performance vector search and BM25 text search as PostgreSQL extensions. Use this instead of the default pgvector setup for better search performance.
+
+**Single instance:**
+
+```bash
+export OPENAI_API_KEY=sk-xxx
+docker compose -f docker/docker-compose/vchord/docker-compose.yaml up -d
+```
+
+>API: http://localhost:8888
+
+**Multiple instances on shared PostgreSQL** — each instance gets its own database/user for full isolation:
+
+```bash
+export OPENAI_API_KEY=sk-xxx
+export DEEPINFRA_API_KEY=your-deepinfra-key
+docker compose -f docker/docker-compose/vchord/docker-compose.multi.yaml up -d
+```
+
+>Agent 1 API: http://localhost:8881
+>Agent 2 API: http://localhost:8882
+
+The multi-instance setup uses DeepInfra for embeddings and reranking via `litellm-sdk`. See `docker/docker-compose/vchord/docker-compose.multi.yaml` for configuration details.
 
 ### Client
 
