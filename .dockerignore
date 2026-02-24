@@ -12,6 +12,7 @@
 # Git
 .git
 .gitignore
+.github/
 
 # IDE
 .idea
@@ -30,3 +31,20 @@ Thumbs.db
 **/coverage
 **/.pytest_cache
 **/.mypy_cache
+
+# Directories not needed in Docker build context
+hindsight-docs/
+hindsight-cli/
+hindsight-dev/
+hindsight/
+hindsight-embed/
+hindsight-integration-tests/
+helm/
+cookbook/
+monitoring/
+scripts/
+.env
+.env.*
+
+# Keep: hindsight-api/, hindsight-clients/typescript/, hindsight-control-plane/,
+#        package.json, package-lock.json, docker/

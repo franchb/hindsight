@@ -1,73 +1,60 @@
-# Hindsight Docker Image
-# Supports building API-only, Control Plane-only, or both
+# syntax=docker/dockerfile:1
+# Hindsight Docker Image — Chainguard-based slim builds
 #
-# Build args:
-#   INCLUDE_API=true/false         - Include API (default: true)
-#   INCLUDE_CP=true/false          - Include Control Plane (default: true)
-#   INCLUDE_LOCAL_MODELS=true/false - Include local ML models for embeddings/reranking (default: true)
-#                                     Set to false when using external providers (TEI, OpenAI, Cohere)
-#   PRELOAD_ML_MODELS=true/false   - Pre-download ML models during build (default: true)
-#                                     Only effective when INCLUDE_LOCAL_MODELS=true
-#                                     NOTE: tiktoken encodings are ALWAYS preloaded (required for air-gapped deployments)
+# Targets:
+#   api-only   — Distroless Python runtime (no shell, ~400MB)
+#   standalone — wolfi-base with Python + Node.js + bash (~500MB)
+#   cp-only    — Node.js Alpine, Control Plane only
 #
-# Examples:
-#   docker build -t hindsight .                                          # Both (standalone)
-#   docker build -t hindsight-api --build-arg INCLUDE_CP=false .         # API only
-#   docker build -t hindsight-cp --build-arg INCLUDE_API=false .         # Control Plane only
-#   docker build -t hindsight --build-arg PRELOAD_ML_MODELS=false .      # Skip ML model preload
-#   docker build -t hindsight --build-arg INCLUDE_LOCAL_MODELS=false .   # Skip local ML deps (for external providers)
-
-ARG INCLUDE_API=true
-ARG INCLUDE_CP=true
-ARG PRELOAD_ML_MODELS=true
-ARG INCLUDE_LOCAL_MODELS=true
+# Build:
+#   podman build -t hindsight-api --target api-only -f docker/standalone/Dockerfile .
+#   podman build -t hindsight --target standalone -f docker/standalone/Dockerfile .
+#
+# Note: Free-tier Chainguard images track latest Python (currently 3.14).
+# If upstream bumps to 3.15, builds may need adjustment.
 
 # =============================================================================
-# Stage: API Builder
+# Stage: API Builder (Chainguard dev — has uv, pip, apk, bash)
 # =============================================================================
-FROM python:3.14-slim AS api-builder
+FROM cgr.dev/chainguard/python:latest-dev AS api-builder
 
-ARG INCLUDE_API
-ARG INCLUDE_LOCAL_MODELS
-RUN if [ "$INCLUDE_API" != "true" ]; then echo "Skipping API build" && exit 0; fi
-
-WORKDIR /app
-
-# Install system dependencies and uv
-RUN apt-get update && apt-get install -y \
-    gcc \
-    g++ \
-    curl \
-    && rm -rf /var/lib/apt/lists/* \
-    && pip install --no-cache-dir uv
-
-# Copy dependency files and README (required by pyproject.toml)
-COPY hindsight-api/pyproject.toml ./api/
-COPY hindsight-api/README.md ./api/
-
+USER root
 WORKDIR /app/api
 
-# Sync dependencies
-# When INCLUDE_LOCAL_MODELS=true, install the local-models extra (sentence-transformers, torch, transformers)
-RUN if [ "$INCLUDE_LOCAL_MODELS" = "true" ]; then \
-        uv sync --extra local-models; \
-    else \
-        uv sync; \
-    fi
+# Install build dependencies for native C extensions (if any wheel lacks a prebuilt)
+RUN apk add --no-cache build-base
 
-# Copy source code (alembic migrations are inside hindsight_api/)
+# Copy dependency files first for Docker layer caching
+COPY hindsight-api/pyproject.toml hindsight-api/README.md ./
+
+# Install dependencies only (project itself installed after source copy)
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv sync --no-dev --no-install-project
+
+# Copy source code (includes alembic migrations inside hindsight_api/)
 COPY hindsight-api/hindsight_api ./hindsight_api
 
-# Install the local package (uv sync only installed dependencies, not the package itself)
-RUN uv pip install -e .
+# Install the project package (editable; deps already present)
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv pip install --no-deps -e .
+
+# Pre-download tiktoken encoding (required at runtime for token counting)
+ENV TIKTOKEN_CACHE_DIR=/tiktoken_cache
+RUN /app/api/.venv/bin/python -c "\
+import tiktoken; \
+tiktoken.get_encoding('cl100k_base'); \
+print('Tiktoken encoding cached')"
+
+# Clean venv: remove tests, caches, and build artifacts
+RUN find .venv -type d \( -name tests -o -name test -o -name __pycache__ \) -exec rm -rf {} + 2>/dev/null; \
+    find .venv \( -name '*.pyc' -o -name '*.pyo' -o -name '*.c' -o -name '*.h' \) -delete 2>/dev/null; \
+    find .venv -name 'LICENSE*' -delete 2>/dev/null; \
+    true
 
 # =============================================================================
 # Stage: SDK Builder (needed for Control Plane)
 # =============================================================================
 FROM node:20-slim AS sdk-builder
-
-ARG INCLUDE_CP
-RUN if [ "$INCLUDE_CP" != "true" ]; then echo "Skipping SDK build" && exit 0; fi
 
 WORKDIR /app
 
@@ -84,11 +71,8 @@ RUN npm run build -w @vectorize-io/hindsight-client
 # =============================================================================
 FROM node:20-slim AS cp-builder
 
-ARG INCLUDE_CP
-RUN if [ "$INCLUDE_CP" != "true" ]; then echo "Skipping CP build" && exit 0; fi
-
 # Create directory structure matching the monorepo layout
-# This is required because build:standalone script expects .next/standalone/memory-poc/hindsight-control-plane
+# Required because build:standalone script expects .next/standalone/memory-poc/hindsight-control-plane
 WORKDIR /app/memory-poc/hindsight-control-plane
 
 # Install Control Plane dependencies
@@ -109,11 +93,9 @@ RUN rm -f package-lock.json && sed -i '/"@vectorize-io\/hindsight-client":/d' pa
 COPY --from=sdk-builder /app/hindsight-clients/typescript ./node_modules/@vectorize-io/hindsight-client
 
 # Accept base path as build argument for reverse proxy deployments
-# Usage: docker build --build-arg NEXT_PUBLIC_BASE_PATH=/hindsight ...
 ARG NEXT_PUBLIC_BASE_PATH=""
 
-# Build Control Plane - run next build first, then custom standalone copy
-# (The build:standalone script expects a specific path structure that differs in Docker)
+# Build Control Plane
 RUN npm exec -- next build
 
 # Create standalone directory structure manually
@@ -123,122 +105,46 @@ RUN STANDALONE_ROOT=$(find .next/standalone -path '*/node_modules' -prune -o -na
     mkdir -p standalone && \
     cp -r "$STANDALONE_ROOT"/* standalone/ && \
     cp -r "$STANDALONE_ROOT"/.next standalone/.next && \
-    # Copy node_modules if separate from app dir (monorepo structure)
     if [ -d ".next/standalone/node_modules" ] && [ "$STANDALONE_ROOT" != ".next/standalone" ]; then \
       cp -r .next/standalone/node_modules standalone/node_modules; \
     fi && \
     cp -r .next/static standalone/.next/static && \
     mkdir -p standalone/public && \
     cp -r public/* standalone/public/ 2>/dev/null || true && \
-    # Verify required files exist
     test -f standalone/server.js || (echo "ERROR: server.js missing!" && exit 1) && \
     test -f standalone/.next/BUILD_ID || (echo "ERROR: BUILD_ID missing!" && exit 1)
 
 # =============================================================================
-# Stage: Final Image - API Only
+# Stage: api-only (Chainguard Python distroless — no shell, nonroot UID 65532)
 # =============================================================================
-FROM python:3.14-slim AS api-only
+FROM cgr.dev/chainguard/python:latest AS api-only
 
 WORKDIR /app
-
-# Note: libicu version varies by Debian version - try common versions in order
-RUN apt-get update && apt-get install -y \
-    curl \
-    procps \
-    libxml2 \
-    libssl3 \
-    libgssapi-krb5-2 \
-    libossp-uuid16 \
-    && (apt-get install -y libicu72 2>/dev/null || apt-get install -y libicu74 2>/dev/null || apt-get install -y libicu76 2>/dev/null || true) \
-    && rm -rf /var/lib/apt/lists/* \
-    && pip install --no-cache-dir uv
-
-RUN useradd -m -s /bin/bash hindsight
 
 # Copy API with virtual environment from builder
 COPY --from=api-builder /app/api /app/api
 
-# Copy startup script
-COPY docker/standalone/start-all.sh /app/start-all.sh
-RUN chmod +x /app/start-all.sh
+# Copy tiktoken cache (root-owned but world-readable; tiktoken only reads)
+COPY --from=api-builder /tiktoken_cache /home/nonroot/.tiktoken
 
-RUN chown -R hindsight:hindsight /app
+# Copy Python entrypoint (no shell available in distroless)
+COPY docker/standalone/entrypoint.py /app/entrypoint.py
 
-USER hindsight
-
-ENV PATH="/app/api/.venv/bin:${PATH}"
-
-# Pre-download tiktoken encoding (ALWAYS - required for token counting even in air-gapped envs)
-# Tiktoken is a core runtime dependency, not an optional ML model
-RUN MAX_RETRIES=3; \
-    RETRY_DELAY=5; \
-    for i in $(seq 1 $MAX_RETRIES); do \
-      echo "Attempt $i/$MAX_RETRIES: Downloading tiktoken encoding..."; \
-      /app/api/.venv/bin/python -c "\
-import tiktoken; \
-print('Downloading cl100k_base encoding...'); \
-tiktoken.get_encoding('cl100k_base'); \
-print('Tiktoken encoding cached successfully')" && break; \
-      if [ $i -lt $MAX_RETRIES ]; then \
-        echo "Attempt $i failed, retrying in ${RETRY_DELAY}s..."; \
-        sleep $RETRY_DELAY; \
-        RETRY_DELAY=$((RETRY_DELAY * 2)); \
-      fi; \
-    done; \
-    if [ $i -eq $MAX_RETRIES ]; then \
-      echo "ERROR: Failed to download tiktoken encoding after $MAX_RETRIES attempts"; \
-      exit 1; \
-    fi
-
-# Pre-download ML models to avoid runtime download (conditional)
-# Only runs if both PRELOAD_ML_MODELS=true AND INCLUDE_LOCAL_MODELS=true
-# Includes retry logic with exponential backoff for transient network failures
-ARG PRELOAD_ML_MODELS
-ARG INCLUDE_LOCAL_MODELS
-ENV HF_HUB_DOWNLOAD_TIMEOUT=600
-RUN if [ "$PRELOAD_ML_MODELS" = "true" ] && [ "$INCLUDE_LOCAL_MODELS" = "true" ]; then \
-    MAX_RETRIES=3; \
-    RETRY_DELAY=10; \
-    for i in $(seq 1 $MAX_RETRIES); do \
-      echo "Attempt $i/$MAX_RETRIES: Downloading ML models..."; \
-      /app/api/.venv/bin/python -c "\
-import os; os.environ['HF_HUB_DOWNLOAD_TIMEOUT'] = '600'; \
-from sentence_transformers import SentenceTransformer, CrossEncoder; \
-print('Downloading embedding model...'); \
-SentenceTransformer('BAAI/bge-small-en-v1.5'); \
-print('Downloading cross-encoder model...'); \
-CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2'); \
-print('Models cached successfully')" && break; \
-      if [ $i -lt $MAX_RETRIES ]; then \
-        echo "Attempt $i failed, retrying in ${RETRY_DELAY}s..."; \
-        sleep $RETRY_DELAY; \
-        RETRY_DELAY=$((RETRY_DELAY * 2)); \
-      fi; \
-    done; \
-    if [ $i -eq $MAX_RETRIES ] && ! /app/api/.venv/bin/python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('BAAI/bge-small-en-v1.5')" 2>/dev/null; then \
-      echo "ERROR: Failed to download models after $MAX_RETRIES attempts"; \
-      exit 1; \
-    fi; \
-    elif [ "$INCLUDE_LOCAL_MODELS" != "true" ]; then echo "Skipping ML model preload (local-models not included)"; \
-    else echo "Skipping ML model preload"; fi
+ENV PATH="/app/api/.venv/bin:${PATH}" \
+    TIKTOKEN_CACHE_DIR=/home/nonroot/.tiktoken \
+    HINDSIGHT_API_HOST=0.0.0.0 \
+    HINDSIGHT_API_PORT=8888 \
+    HINDSIGHT_API_LOG_LEVEL=info \
+    HINDSIGHT_ENABLE_API=true \
+    HINDSIGHT_ENABLE_CP=false \
+    PYTHONUNBUFFERED=1
 
 EXPOSE 8888
 
-ENV HINDSIGHT_API_HOST=0.0.0.0
-ENV HINDSIGHT_API_PORT=8888
-ENV HINDSIGHT_API_LOG_LEVEL=info
-ENV HINDSIGHT_ENABLE_API=true
-ENV HINDSIGHT_ENABLE_CP=false
-ENV PYTHONUNBUFFERED=1
-# Suppress verbose transformers/HuggingFace model loading warnings
-ENV TRANSFORMERS_VERBOSITY=error
-ENV HF_HUB_VERBOSITY=error
-ENV TOKENIZERS_PARALLELISM=false
-
-CMD ["/app/start-all.sh"]
+ENTRYPOINT ["python", "/app/entrypoint.py"]
 
 # =============================================================================
-# Stage: Final Image - Control Plane Only
+# Stage: cp-only (Node.js Alpine — Control Plane only)
 # =============================================================================
 FROM node:20-alpine AS cp-only
 
@@ -264,39 +170,28 @@ RUN apk add --no-cache curl bash
 
 EXPOSE 9999
 
-ENV NODE_ENV=production
-ENV HINDSIGHT_CP_DATAPLANE_API_URL=http://localhost:8888
-ENV HINDSIGHT_ENABLE_API=false
-ENV HINDSIGHT_ENABLE_CP=true
+ENV NODE_ENV=production \
+    HINDSIGHT_CP_DATAPLANE_API_URL=http://localhost:8888 \
+    HINDSIGHT_ENABLE_API=false \
+    HINDSIGHT_ENABLE_CP=true
 
 CMD ["/app/start-all.sh"]
 
 # =============================================================================
-# Stage: Final Image - Standalone (both API and Control Plane)
+# Stage: standalone (Chainguard wolfi-base — Python + Node.js + bash)
 # =============================================================================
-FROM python:3.14-slim AS standalone
+FROM cgr.dev/chainguard/wolfi-base AS standalone
+
+# Install runtime dependencies (wolfi-base provides apk + ash; add bash explicitly)
+RUN apk add --no-cache python-3.14 nodejs-20 curl bash
 
 WORKDIR /app
 
-# Install Node.js, curl, uv, and system dependencies
-# Note: libicu version varies by Debian version - try common versions in order
-RUN apt-get update && apt-get install -y \
-    curl \
-    procps \
-    libxml2 \
-    libssl3 \
-    libgssapi-krb5-2 \
-    libossp-uuid16 \
-    && (apt-get install -y libicu72 2>/dev/null || apt-get install -y libicu74 2>/dev/null || apt-get install -y libicu76 2>/dev/null || true) \
-    && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
-    && apt-get install -y nodejs \
-    && rm -rf /var/lib/apt/lists/* \
-    && pip install --no-cache-dir uv
-
-RUN useradd -m -s /bin/bash hindsight
-
 # Copy API with virtual environment from builder
 COPY --from=api-builder /app/api /app/api
+
+# Copy tiktoken cache
+COPY --from=api-builder /tiktoken_cache /home/nonroot/.tiktoken
 
 # Copy built SDK
 COPY --from=sdk-builder /app/hindsight-clients/typescript /app/sdk
@@ -313,90 +208,23 @@ WORKDIR /app
 COPY docker/standalone/start-all.sh /app/start-all.sh
 RUN chmod +x /app/start-all.sh
 
-RUN chown -R hindsight:hindsight /app
+# Run as nonroot (UID 65532, built into wolfi-base)
+USER nonroot
 
-USER hindsight
-
-ENV PATH="/app/api/.venv/bin:${PATH}"
-
-# Pre-download tiktoken encoding (ALWAYS - required for token counting even in air-gapped envs)
-# Tiktoken is a core runtime dependency, not an optional ML model
-RUN MAX_RETRIES=3; \
-    RETRY_DELAY=5; \
-    for i in $(seq 1 $MAX_RETRIES); do \
-      echo "Attempt $i/$MAX_RETRIES: Downloading tiktoken encoding..."; \
-      /app/api/.venv/bin/python -c "\
-import tiktoken; \
-print('Downloading cl100k_base encoding...'); \
-tiktoken.get_encoding('cl100k_base'); \
-print('Tiktoken encoding cached successfully')" && break; \
-      if [ $i -lt $MAX_RETRIES ]; then \
-        echo "Attempt $i failed, retrying in ${RETRY_DELAY}s..."; \
-        sleep $RETRY_DELAY; \
-        RETRY_DELAY=$((RETRY_DELAY * 2)); \
-      fi; \
-    done; \
-    if [ $i -eq $MAX_RETRIES ]; then \
-      echo "ERROR: Failed to download tiktoken encoding after $MAX_RETRIES attempts"; \
-      exit 1; \
-    fi
-
-# Pre-download ML models to avoid runtime download (conditional)
-# Only runs if both PRELOAD_ML_MODELS=true AND INCLUDE_LOCAL_MODELS=true
-# Includes retry logic with exponential backoff for transient network failures
-ARG PRELOAD_ML_MODELS
-ARG INCLUDE_LOCAL_MODELS
-ENV HF_HUB_DOWNLOAD_TIMEOUT=600
-RUN if [ "$PRELOAD_ML_MODELS" = "true" ] && [ "$INCLUDE_LOCAL_MODELS" = "true" ]; then \
-    MAX_RETRIES=3; \
-    RETRY_DELAY=10; \
-    for i in $(seq 1 $MAX_RETRIES); do \
-      echo "Attempt $i/$MAX_RETRIES: Downloading ML models..."; \
-      /app/api/.venv/bin/python -c "\
-import os; os.environ['HF_HUB_DOWNLOAD_TIMEOUT'] = '600'; \
-from sentence_transformers import SentenceTransformer, CrossEncoder; \
-print('Downloading embedding model...'); \
-SentenceTransformer('BAAI/bge-small-en-v1.5'); \
-print('Downloading cross-encoder model...'); \
-CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2'); \
-print('Models cached successfully')" && break; \
-      if [ $i -lt $MAX_RETRIES ]; then \
-        echo "Attempt $i failed, retrying in ${RETRY_DELAY}s..."; \
-        sleep $RETRY_DELAY; \
-        RETRY_DELAY=$((RETRY_DELAY * 2)); \
-      fi; \
-    done; \
-    if [ $i -eq $MAX_RETRIES ] && ! /app/api/.venv/bin/python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('BAAI/bge-small-en-v1.5')" 2>/dev/null; then \
-      echo "ERROR: Failed to download models after $MAX_RETRIES attempts"; \
-      exit 1; \
-    fi; \
-    elif [ "$INCLUDE_LOCAL_MODELS" != "true" ]; then echo "Skipping ML model preload (local-models not included)"; \
-    else echo "Skipping ML model preload"; fi
+ENV PATH="/app/api/.venv/bin:${PATH}" \
+    TIKTOKEN_CACHE_DIR=/home/nonroot/.tiktoken \
+    HINDSIGHT_API_HOST=0.0.0.0 \
+    HINDSIGHT_API_PORT=8888 \
+    HINDSIGHT_API_LOG_LEVEL=info \
+    NODE_ENV=production \
+    HINDSIGHT_CP_DATAPLANE_API_URL=http://localhost:8888 \
+    HINDSIGHT_ENABLE_API=true \
+    HINDSIGHT_ENABLE_CP=true \
+    PYTHONUNBUFFERED=1
 
 EXPOSE 8888 9999
 
-ENV HINDSIGHT_API_HOST=0.0.0.0
-ENV HINDSIGHT_API_PORT=8888
-ENV HINDSIGHT_API_LOG_LEVEL=info
-ENV NODE_ENV=production
-ENV HINDSIGHT_CP_DATAPLANE_API_URL=http://localhost:8888
-ENV HINDSIGHT_ENABLE_API=true
-ENV HINDSIGHT_ENABLE_CP=true
-ENV PYTHONUNBUFFERED=1
-# Suppress verbose transformers/HuggingFace model loading warnings
-ENV TRANSFORMERS_VERBOSITY=error
-ENV HF_HUB_VERBOSITY=error
-ENV TOKENIZERS_PARALLELISM=false
-
 CMD ["/app/start-all.sh"]
 
-# =============================================================================
-# Default target selection based on build args
-# =============================================================================
-FROM standalone AS default-both
-FROM api-only AS default-api
-FROM cp-only AS default-cp
-
-# This selects the final stage based on INCLUDE_API and INCLUDE_CP
-# Use --target to override: docker build --target api-only .
+# Default target
 FROM standalone
