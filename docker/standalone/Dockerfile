@@ -4,7 +4,7 @@
 # Targets:
 #   api-only   — Distroless Python runtime (no shell, ~400MB)
 #   standalone — wolfi-base with Python + Node.js + bash (~500MB)
-#   cp-only    — Node.js Alpine, Control Plane only
+#   cp-only    — Chainguard Node.js distroless, Control Plane only
 #
 # Build:
 #   podman build -t hindsight-api --target api-only -f docker/standalone/Dockerfile .
@@ -144,38 +144,22 @@ EXPOSE 8888
 ENTRYPOINT ["python", "/app/entrypoint.py"]
 
 # =============================================================================
-# Stage: cp-only (Node.js Alpine — Control Plane only)
+# Stage: cp-only (Chainguard Node.js distroless — Control Plane only)
 # =============================================================================
-FROM node:20-alpine AS cp-only
+FROM cgr.dev/chainguard/node:latest AS cp-only
 
-WORKDIR /app
-
-# Copy built SDK
-COPY --from=sdk-builder /app/hindsight-clients/typescript /app/sdk
-
-# Copy Control Plane standalone build
 WORKDIR /app/control-plane
+
+# Copy Control Plane standalone build (includes .next/static and public/)
 COPY --from=cp-builder /app/memory-poc/hindsight-control-plane/standalone ./
-COPY --from=cp-builder /app/memory-poc/hindsight-control-plane/.next/static ./.next/static
-COPY --from=cp-builder /app/memory-poc/hindsight-control-plane/public ./public
-
-WORKDIR /app
-
-# Copy startup script
-COPY docker/standalone/start-all.sh /app/start-all.sh
-RUN chmod +x /app/start-all.sh
-
-# Install curl for health checks
-RUN apk add --no-cache curl bash
 
 EXPOSE 9999
 
 ENV NODE_ENV=production \
     HINDSIGHT_CP_DATAPLANE_API_URL=http://localhost:8888 \
-    HINDSIGHT_ENABLE_API=false \
-    HINDSIGHT_ENABLE_CP=true
+    PORT=9999
 
-CMD ["/app/start-all.sh"]
+CMD ["server.js"]
 
 # =============================================================================
 # Stage: standalone (Chainguard wolfi-base — Python + Node.js + bash)
