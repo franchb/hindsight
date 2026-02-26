@@ -114,13 +114,16 @@ jobs:
         include:
           - target: api-only
             name: api-slim
-            smoke_cmd: "python -c \"import hindsight_api; import tiktoken; print('OK')\""
+            smoke_entrypoint: python
+            smoke_cmd: "-c \"import hindsight_api; import tiktoken; print('OK')\""
           - target: standalone
             name: standalone-slim
-            smoke_cmd: "python -c \"import hindsight_api; import tiktoken; print('OK')\""
+            smoke_entrypoint: python
+            smoke_cmd: "-c \"import hindsight_api; import tiktoken; print('OK')\""
           - target: cp-only
             name: cp-slim
-            smoke_cmd: "node -e \"console.log('OK')\""
+            smoke_entrypoint: node
+            smoke_cmd: "-e \"console.log('OK')\""
 
     steps:
     - uses: actions/checkout@v4
@@ -139,7 +142,7 @@ jobs:
         tags: hindsight-${{ matrix.name }}:test
 
     - name: Smoke test ${{ matrix.name }}
-      run: docker run --rm hindsight-${{ matrix.name }}:test ${{ matrix.smoke_cmd }}
+      run: docker run --rm --entrypoint ${{ matrix.smoke_entrypoint }} hindsight-${{ matrix.name }}:test ${{ matrix.smoke_cmd }}
 
     - name: Show image size
       run: docker images hindsight-${{ matrix.name }}:test --format "{{.Repository}}:{{.Tag}} {{.Size}}"
