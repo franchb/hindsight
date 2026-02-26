@@ -1,0 +1,108 @@
+name: hindsight-multi
+# Multi-instance Hindsight on shared VectorChord PostgreSQL
+#
+# Two Hindsight API instances sharing one database container,
+# each with its own database/user/password for full isolation.
+#
+# Usage:
+#   docker compose -f docker/docker-compose/vchord/docker-compose.multi.yaml up -d
+#
+# Required environment variables (set in .env or shell):
+#   OPENAI_API_KEY          - OpenAI API key for LLM
+#   DEEPINFRA_API_KEY       - DeepInfra API key for embeddings/reranker
+#
+# Verification:
+#   curl http://localhost:8881/health
+#   curl http://localhost:8882/health
+#   docker exec hindsight-multi-db psql -U hindsight_admin -d hindsight_agent1 \
+#     -c "SELECT extname FROM pg_extension;"
+
+services:
+  db:
+    image: tensorchord/vchord-suite:pg18-latest
+    container_name: hindsight-multi-db
+    restart: always
+    ports:
+      - "5436:5432"
+    environment:
+      POSTGRES_USER: hindsight_admin
+      POSTGRES_PASSWORD: hindsight_admin_pass
+      POSTGRES_DB: hindsight_default
+      EXTRA_DATABASES: hindsight_agent1:agent1_user:agent1_pass,hindsight_agent2:agent2_user:agent2_pass
+    volumes:
+      - pg_data:/var/lib/postgresql/18/docker
+      - ./init-vchord.sh:/docker-entrypoint-initdb.d/init-vchord.sh:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U hindsight_admin -d hindsight_default"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - hindsight-net
+
+  hindsight-agent1:
+    image: ghcr.io/franchb/hindsight-api:latest-slim
+    container_name: hindsight-agent1
+    ports:
+      - "8881:8888"
+    environment:
+      # LLM
+      HINDSIGHT_API_LLM_PROVIDER: openai
+      HINDSIGHT_API_LLM_API_KEY: ${OPENAI_API_KEY}
+      # Database (isolated DB per instance)
+      HINDSIGHT_API_DATABASE_URL: postgresql://agent1_user:agent1_pass@db:5432/hindsight_agent1
+      # VectorChord extensions
+      HINDSIGHT_API_VECTOR_EXTENSION: vchord
+      HINDSIGHT_API_TEXT_SEARCH_EXTENSION: vchord
+      # Embeddings via DeepInfra (litellm-sdk)
+      HINDSIGHT_API_EMBEDDINGS_PROVIDER: litellm-sdk
+      HINDSIGHT_API_EMBEDDINGS_LITELLM_SDK_MODEL: openai/Qwen/Qwen3-Embedding-8B
+      HINDSIGHT_API_EMBEDDINGS_LITELLM_SDK_API_KEY: ${DEEPINFRA_API_KEY}
+      HINDSIGHT_API_EMBEDDINGS_LITELLM_SDK_API_BASE: https://api.deepinfra.com/v1/openai
+      # Reranker via DeepInfra (litellm-sdk)
+      HINDSIGHT_API_RERANKER_PROVIDER: litellm-sdk
+      HINDSIGHT_API_RERANKER_LITELLM_SDK_MODEL: deepinfra/Qwen/Qwen3-Reranker-8B
+      HINDSIGHT_API_RERANKER_LITELLM_SDK_API_KEY: ${DEEPINFRA_API_KEY}
+      HINDSIGHT_API_RERANKER_LITELLM_SDK_API_BASE: https://api.deepinfra.com/v1
+    depends_on:
+      db:
+        condition: service_healthy
+    networks:
+      - hindsight-net
+
+  hindsight-agent2:
+    image: ghcr.io/franchb/hindsight-api:latest-slim
+    container_name: hindsight-agent2
+    ports:
+      - "8882:8888"
+    environment:
+      # LLM
+      HINDSIGHT_API_LLM_PROVIDER: openai
+      HINDSIGHT_API_LLM_API_KEY: ${OPENAI_API_KEY}
+      # Database (isolated DB per instance)
+      HINDSIGHT_API_DATABASE_URL: postgresql://agent2_user:agent2_pass@db:5432/hindsight_agent2
+      # VectorChord extensions
+      HINDSIGHT_API_VECTOR_EXTENSION: vchord
+      HINDSIGHT_API_TEXT_SEARCH_EXTENSION: vchord
+      # Embeddings via DeepInfra (litellm-sdk)
+      HINDSIGHT_API_EMBEDDINGS_PROVIDER: litellm-sdk
+      HINDSIGHT_API_EMBEDDINGS_LITELLM_SDK_MODEL: openai/Qwen/Qwen3-Embedding-8B
+      HINDSIGHT_API_EMBEDDINGS_LITELLM_SDK_API_KEY: ${DEEPINFRA_API_KEY}
+      HINDSIGHT_API_EMBEDDINGS_LITELLM_SDK_API_BASE: https://api.deepinfra.com/v1/openai
+      # Reranker via DeepInfra (litellm-sdk)
+      HINDSIGHT_API_RERANKER_PROVIDER: litellm-sdk
+      HINDSIGHT_API_RERANKER_LITELLM_SDK_MODEL: deepinfra/Qwen/Qwen3-Reranker-8B
+      HINDSIGHT_API_RERANKER_LITELLM_SDK_API_KEY: ${DEEPINFRA_API_KEY}
+      HINDSIGHT_API_RERANKER_LITELLM_SDK_API_BASE: https://api.deepinfra.com/v1
+    depends_on:
+      db:
+        condition: service_healthy
+    networks:
+      - hindsight-net
+
+networks:
+  hindsight-net:
+    driver: bridge
+
+volumes:
+  pg_data:

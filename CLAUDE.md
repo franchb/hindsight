@@ -41,8 +41,12 @@ This is a fork of [vectorize-io/hindsight](https://github.com/vectorize-io/hinds
 ```
 HINDSIGHT_API_LLM_PROVIDER=openai
 HINDSIGHT_API_EMBEDDINGS_PROVIDER=litellm-sdk
-HINDSIGHT_API_EMBEDDINGS_LITELLM_SDK_MODEL=deepinfra/BAAI/bge-small-en-v1.5
+# Use openai/ prefix (not deepinfra/) because litellm has no deepinfra/embedding/ handler.
+# The openai/ prefix routes through litellm's OpenAI handler with a custom base_url.
+HINDSIGHT_API_EMBEDDINGS_LITELLM_SDK_MODEL=openai/Qwen/Qwen3-Embedding-8B
+HINDSIGHT_API_EMBEDDINGS_LITELLM_SDK_API_BASE=https://api.deepinfra.com/v1/openai
 HINDSIGHT_API_RERANKER_PROVIDER=litellm-sdk
+HINDSIGHT_API_RERANKER_LITELLM_SDK_MODEL=deepinfra/Qwen/Qwen3-Reranker-8B
 ```
 
 ### Syncing with upstream
