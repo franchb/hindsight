@@ -19,6 +19,8 @@ jobs:
             image_name: hindsight-api
           - target: standalone
             image_name: hindsight
+          - target: cp-only
+            image_name: hindsight-control-plane
 
     steps:
     - uses: actions/checkout@v4

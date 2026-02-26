@@ -15,9 +15,6 @@ from hindsight_api.config_resolver import ConfigResolver
 from hindsight_api.extensions.tenant import TenantExtension
 from hindsight_api.models import RequestContext
 
-# Enable bank config API for all tests in this module
-os.environ["HINDSIGHT_API_ENABLE_BANK_CONFIG_API"] = "true"
-
 
 class MockTenantExtension(TenantExtension):
     """Mock tenant extension for testing tenant-level config."""
@@ -85,7 +82,7 @@ async def test_hierarchical_fields_categorization():
     assert "disposition_empathy" in configurable
 
     # Verify count is correct
-    assert len(configurable) == 10
+    assert len(configurable) == 11
 
     # Verify credential fields (NEVER exposed)
     assert "llm_api_key" in credentials

@@ -16,7 +16,7 @@ This is a fork of [vectorize-io/hindsight](https://github.com/vectorize-io/hinds
 ### Divergence from upstream
 
 - **CI**: Upstream has ~20 CI jobs using Vertex AI, Cohere, multi-platform builds, PyPI/npm publishing, Helm, Rust CLI builds, and GCP credentials. This fork replaces all of that with two minimal workflows (see below).
-- **Docker images**: Only slim variants are built (`INCLUDE_LOCAL_MODELS=false`), targeting `linux/amd64` only. Images are published to `ghcr.io/franchb/` (not upstream's registry).
+- **Docker images**: Three slim variants are built (`api-slim`, `standalone-slim`, `cp-slim` with `INCLUDE_LOCAL_MODELS=false`), targeting `linux/amd64` only. Images are published to `ghcr.io/franchb/` (not upstream's registry).
 - **No PyPI/npm publishing**: This fork does not publish packages. Only Docker images are released.
 
 ### CI workflows (`.github/workflows/`)
@@ -27,12 +27,12 @@ This is a fork of [vectorize-io/hindsight](https://github.com/vectorize-io/hinds
 | `lint` | Python 3.11 + Node 20. Runs `./scripts/hooks/lint.sh` (Ruff, ty, ESLint, Prettier) |
 | `unit-tests` | Pure unit tests only -- no LLM calls, no HuggingFace models, no DB. Explicit test file list. |
 | `build-api` | `uv build` in hindsight-api |
-| `build-docker-slim` | Matrix: `api-slim` + `standalone-slim`. Build-only, no push. Validates Dockerfile. |
+| `build-docker-slim` | Matrix: `api-slim` + `standalone-slim` + `cp-slim`. Build-only, no push. Validates Dockerfile. |
 
 **`release.yml`** -- runs on `v*` tags:
 | Job | What it does |
 |-----|-------------|
-| `build-and-push-images` | Matrix: `hindsight-api` + `hindsight`. Slim only, `linux/amd64`, pushes to `ghcr.io/franchb/<image>`. Tags: `X.Y.Z-slim`, `X.Y-slim`, `X-slim`, `latest-slim`. |
+| `build-and-push-images` | Matrix: `hindsight-api` + `hindsight` + `hindsight-control-plane`. Slim only, `linux/amd64`, pushes to `ghcr.io/franchb/<image>`. Tags: `X.Y.Z-slim`, `X.Y-slim`, `X-slim`, `latest-slim`. |
 
 **No secrets required** beyond the automatic `GITHUB_TOKEN`. Future enhancement: add `OPENAI_API_KEY` and `DEEPINFRA_API_KEY` if smoke tests are needed.
 
@@ -368,4 +368,4 @@ Optional (uses local models by default):
 - `HINDSIGHT_API_EMBEDDINGS_PROVIDER`: local (default) or tei
 - `HINDSIGHT_API_RERANKER_PROVIDER`: local (default) or tei
 - `HINDSIGHT_API_DATABASE_URL`: External PostgreSQL (uses embedded pg0 by default)
-- `HINDSIGHT_API_ENABLE_BANK_CONFIG_API`: Enable per-bank config API (default: false, disabled for security)
+- `HINDSIGHT_API_ENABLE_BANK_CONFIG_API`: Enable per-bank config API (default: true)

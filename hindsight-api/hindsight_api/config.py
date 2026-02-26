@@ -232,6 +232,7 @@ ENV_LOG_LEVEL = "HINDSIGHT_API_LOG_LEVEL"
 ENV_LOG_FORMAT = "HINDSIGHT_API_LOG_FORMAT"
 ENV_WORKERS = "HINDSIGHT_API_WORKERS"
 ENV_MCP_ENABLED = "HINDSIGHT_API_MCP_ENABLED"
+ENV_MCP_ENABLED_TOOLS = "HINDSIGHT_API_MCP_ENABLED_TOOLS"
 ENV_ENABLE_BANK_CONFIG_API = "HINDSIGHT_API_ENABLE_BANK_CONFIG_API"
 ENV_GRAPH_RETRIEVER = "HINDSIGHT_API_GRAPH_RETRIEVER"
 ENV_MPFP_TOP_K_NEIGHBORS = "HINDSIGHT_API_MPFP_TOP_K_NEIGHBORS"
@@ -285,6 +286,7 @@ ENV_FILE_DELETE_AFTER_RETAIN = "HINDSIGHT_API_FILE_DELETE_AFTER_RETAIN"
 # Observations settings (consolidated knowledge from facts)
 ENV_ENABLE_OBSERVATIONS = "HINDSIGHT_API_ENABLE_OBSERVATIONS"
 ENV_CONSOLIDATION_BATCH_SIZE = "HINDSIGHT_API_CONSOLIDATION_BATCH_SIZE"
+ENV_CONSOLIDATION_LLM_BATCH_SIZE = "HINDSIGHT_API_CONSOLIDATION_LLM_BATCH_SIZE"
 ENV_CONSOLIDATION_MAX_TOKENS = "HINDSIGHT_API_CONSOLIDATION_MAX_TOKENS"
 ENV_OBSERVATIONS_MISSION = "HINDSIGHT_API_OBSERVATIONS_MISSION"
 
@@ -396,7 +398,8 @@ DEFAULT_LOG_LEVEL = "info"
 DEFAULT_LOG_FORMAT = "text"  # Options: "text", "json"
 DEFAULT_WORKERS = 1
 DEFAULT_MCP_ENABLED = True
-DEFAULT_ENABLE_BANK_CONFIG_API = False  # Disabled by default for security
+DEFAULT_MCP_ENABLED_TOOLS: list[str] | None = None  # None = all tools enabled
+DEFAULT_ENABLE_BANK_CONFIG_API = True
 DEFAULT_GRAPH_RETRIEVER = "link_expansion"  # Options: "link_expansion", "mpfp", "bfs"
 DEFAULT_MPFP_TOP_K_NEIGHBORS = 20  # Fan-out limit per node in MPFP graph traversal
 DEFAULT_RECALL_MAX_CONCURRENT = 32  # Max concurrent recall operations per worker
@@ -426,7 +429,8 @@ DEFAULT_FILE_DELETE_AFTER_RETAIN = True  # Delete file bytes after retain (saves
 # Observations defaults (consolidated knowledge from facts)
 DEFAULT_ENABLE_OBSERVATIONS = True  # Observations enabled by default
 DEFAULT_CONSOLIDATION_BATCH_SIZE = 50  # Memories to load per batch (internal memory optimization)
-DEFAULT_CONSOLIDATION_MAX_TOKENS = 1024  # Max tokens for recall when finding related observations
+DEFAULT_CONSOLIDATION_LLM_BATCH_SIZE = 8  # Facts per LLM call (1 = no batching; >1 = batch mode)
+DEFAULT_CONSOLIDATION_MAX_TOKENS = 512  # Max tokens for recall when finding related observations
 DEFAULT_OBSERVATIONS_MISSION = None  # Declarative spec of what observations are for this bank
 
 # Database migrations
@@ -636,6 +640,7 @@ class HindsightConfig:
     log_level: str
     log_format: str
     mcp_enabled: bool
+    mcp_enabled_tools: list[str] | None  # None = all tools; explicit list = allowlist
     enable_bank_config_api: bool
 
     # Recall
@@ -679,6 +684,7 @@ class HindsightConfig:
     # Observations settings (consolidated knowledge from facts)
     enable_observations: bool
     consolidation_batch_size: int
+    consolidation_llm_batch_size: int
     consolidation_max_tokens: int
     observations_mission: str | None
 
@@ -754,6 +760,8 @@ class HindsightConfig:
     # These fields are manually tagged as safe to expose and modify.
     # Excludes credentials, infrastructure config, provider/model selection, and performance tuning.
     _CONFIGURABLE_FIELDS = {
+        # MCP tool access control
+        "mcp_enabled_tools",
         # Retention settings (behavioral)
         "retain_chunk_size",
         "retain_extraction_mode",
@@ -1030,6 +1038,9 @@ class HindsightConfig:
             log_level=os.getenv(ENV_LOG_LEVEL, DEFAULT_LOG_LEVEL),
             log_format=os.getenv(ENV_LOG_FORMAT, DEFAULT_LOG_FORMAT).lower(),
             mcp_enabled=os.getenv(ENV_MCP_ENABLED, str(DEFAULT_MCP_ENABLED)).lower() == "true",
+            mcp_enabled_tools=[t.strip() for t in os.getenv(ENV_MCP_ENABLED_TOOLS).split(",") if t.strip()]
+            if os.getenv(ENV_MCP_ENABLED_TOOLS)
+            else DEFAULT_MCP_ENABLED_TOOLS,
             enable_bank_config_api=os.getenv(ENV_ENABLE_BANK_CONFIG_API, str(DEFAULT_ENABLE_BANK_CONFIG_API)).lower()
             == "true",
             # Recall
@@ -1096,6 +1107,9 @@ class HindsightConfig:
             enable_observations=os.getenv(ENV_ENABLE_OBSERVATIONS, str(DEFAULT_ENABLE_OBSERVATIONS)).lower() == "true",
             consolidation_batch_size=int(
                 os.getenv(ENV_CONSOLIDATION_BATCH_SIZE, str(DEFAULT_CONSOLIDATION_BATCH_SIZE))
+            ),
+            consolidation_llm_batch_size=int(
+                os.getenv(ENV_CONSOLIDATION_LLM_BATCH_SIZE, str(DEFAULT_CONSOLIDATION_LLM_BATCH_SIZE))
             ),
             consolidation_max_tokens=int(
                 os.getenv(ENV_CONSOLIDATION_MAX_TOKENS, str(DEFAULT_CONSOLIDATION_MAX_TOKENS))
