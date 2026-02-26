@@ -37,9 +37,36 @@ client.update_bank_config(
 # [/docs:bank-with-disposition]
 
 
-# [docs:update-bank-config]
-# Requires HINDSIGHT_API_ENABLE_BANK_CONFIG_API=true on the server
+# [docs:bank-background]
+client.create_bank(bank_id="my-bank")
+client.update_bank_config(
+    "my-bank",
+    reflect_mission="I am a research assistant specializing in machine learning.",
+)
+# [/docs:bank-background]
 
+
+# [docs:bank-mission]
+client.create_bank(bank_id="my-bank")
+client.update_bank_config(
+    "my-bank",
+    reflect_mission="You're a senior software architect - keep track of system designs, "
+            "technology decisions, and architectural patterns.",
+)
+# [/docs:bank-mission]
+
+
+# [docs:bank-support-agent]
+client.create_bank(bank_id="support-bank")
+client.update_bank_config(
+    "support-bank",
+    observations_mission="I am a customer support agent. Track customer preferences, "
+            "recurring issues, and resolution history to provide consistent, personalized support.",
+)
+# [/docs:bank-support-agent]
+
+
+# [docs:update-bank-config]
 client.update_bank_config(
     "my-bank",
     retain_mission="Always include technical decisions, API design choices, and architectural trade-offs. Ignore meeting logistics and social exchanges.",

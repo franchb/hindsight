@@ -1435,22 +1435,20 @@ class TestObservationDrillDown:
 
         assert result["count"] > 0, "Expected at least one observation"
 
-        # Verify source_memory_ids and proof_count are present
+        # Verify source_fact_ids is present (MemoryFact field name for source memories)
         obs = result["observations"][0]
-        assert "source_memory_ids" in obs, "Observation should have source_memory_ids"
-        assert "proof_count" in obs, "Observation should have proof_count"
-        assert obs["proof_count"] >= 1, "proof_count should be at least 1"
+        assert "source_fact_ids" in obs, "Observation should have source_fact_ids"
 
-        # If source_memory_ids exist, verify they can be used with expand
-        if obs["source_memory_ids"]:
-            assert len(obs["source_memory_ids"]) >= 1, "Should have at least one source memory"
+        # If source_fact_ids exist, verify they can be used with expand
+        if obs["source_fact_ids"]:
+            assert len(obs["source_fact_ids"]) >= 1, "Should have at least one source memory"
 
             # Use expand tool to get source memory details
             async with memory._pool.acquire() as conn:
                 expand_result = await tool_expand(
                     conn=conn,
                     bank_id=bank_id,
-                    memory_ids=obs["source_memory_ids"][:2],  # Take first 2
+                    memory_ids=obs["source_fact_ids"][:2],  # Take first 2
                     depth="chunk",
                 )
 
@@ -1717,11 +1715,10 @@ class TestHierarchicalRetrieval:
             query="What was the quarterly revenue?",
             request_context=request_context,
             max_tokens=2048,
-            max_results=10,
         )
 
         # Should have raw facts with specific numbers
-        assert recall_result["count"] >= 1, "Recall should find the raw facts"
+        assert len(recall_result["memories"]) >= 1, "Recall should find the raw facts"
 
         # Check that we get the actual numbers from the original memories
         all_memory_text = " ".join([m["text"] for m in recall_result["memories"]])
@@ -1993,35 +1990,35 @@ class TestMentalModelRefreshAfterConsolidation:
 
 
 def test_consolidation_prompt_default():
-    """Test that the default consolidation prompt contains the built-in durable-knowledge rules."""
-    from hindsight_api.engine.consolidation.prompts import build_consolidation_prompt
+    """Test that the default consolidation prompt contains the built-in mission and processing rules."""
+    from hindsight_api.engine.consolidation.prompts import build_batch_consolidation_prompt
 
-    prompt = build_consolidation_prompt()
-    assert "DURABLE KNOWLEDGE" in prompt
+    prompt = build_batch_consolidation_prompt()
     assert "temporal markers" in prompt
-    assert "{fact_text}" in prompt
+    assert "RESOLVE REFERENCES" in prompt
+    assert "{facts_text}" in prompt
     assert "{observations_text}" in prompt
 
 
 def test_consolidation_prompt_observations_mission():
-    """Test that observations_mission replaces the default rules."""
-    from hindsight_api.engine.consolidation.prompts import build_consolidation_prompt
+    """Test that observations_mission replaces the default mission but keeps processing rules."""
+    from hindsight_api.engine.consolidation.prompts import build_batch_consolidation_prompt
 
     spec = "Observations are weekly summaries of sprint outcomes and team dynamics."
-    prompt = build_consolidation_prompt(observations_mission=spec)
+    prompt = build_batch_consolidation_prompt(observations_mission=spec)
 
     # Spec is injected
     assert spec in prompt
-    # Default rules are NOT present
-    assert "EXTRACT DURABLE KNOWLEDGE" not in prompt
-    # Output format and data placeholders remain
-    assert "actions" in prompt
-    assert "{fact_text}" in prompt
+    # Processing rules and output format always remain
+    assert "RESOLVE REFERENCES" in prompt
+    assert "creates" in prompt
+    assert "updates" in prompt
+    assert "{facts_text}" in prompt
     assert "{observations_text}" in prompt
 
     # Renders cleanly
-    rendered = prompt.format(fact_text="Alice fixed a bug.", observations_text="[]")
-    assert "{fact_text}" not in rendered
+    rendered = prompt.format(facts_text="Alice fixed a bug.", observations_text="[]")
+    assert "{facts_text}" not in rendered
     assert spec in rendered
 
 

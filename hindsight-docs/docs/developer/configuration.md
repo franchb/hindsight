@@ -733,6 +733,7 @@ Observations are consolidated knowledge synthesized from facts.
 | `HINDSIGHT_API_ENABLE_OBSERVATIONS` | Enable observation consolidation | `true` |
 | `HINDSIGHT_API_CONSOLIDATION_BATCH_SIZE` | Memories to load per batch (internal optimization) | `50` |
 | `HINDSIGHT_API_CONSOLIDATION_MAX_TOKENS` | Max tokens for recall when finding related observations during consolidation | `1024` |
+| `HINDSIGHT_API_CONSOLIDATION_LLM_BATCH_SIZE` | Number of facts sent to the LLM in a single consolidation call. Higher values reduce LLM calls and improve throughput at the cost of larger prompts. Set to `1` to disable batching. | `8` |
 | `HINDSIGHT_API_OBSERVATIONS_MISSION` | What this bank should synthesise into durable observations. Replaces the built-in consolidation rules — leave unset to use the server default. | - |
 
 #### Customizing observations: when to use what
@@ -798,9 +799,35 @@ Configuration for MCP server endpoints.
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `HINDSIGHT_API_MCP_ENABLED` | Enable MCP server at `/mcp/{bank_id}/` | `true` |
+| `HINDSIGHT_API_MCP_ENABLED_TOOLS` | Comma-separated allowlist of MCP tools to expose globally (empty = all tools) | - |
 | `HINDSIGHT_API_MCP_AUTH_TOKEN` | Bearer token for MCP authentication (optional) | - |
 | `HINDSIGHT_API_MCP_LOCAL_BANK_ID` | Memory bank ID for local MCP | `mcp` |
 | `HINDSIGHT_API_MCP_INSTRUCTIONS` | Additional instructions appended to retain/recall tool descriptions | - |
+
+**Tool Access Control:**
+
+`HINDSIGHT_API_MCP_ENABLED_TOOLS` restricts which MCP tools are registered at the server level. This is useful for read-only deployments or limiting surface area:
+
+```bash
+# Expose only recall (read-only deployment)
+export HINDSIGHT_API_MCP_ENABLED_TOOLS=recall
+
+# Expose recall and reflect only
+export HINDSIGHT_API_MCP_ENABLED_TOOLS=recall,reflect
+```
+
+Available tool names: `retain`, `recall`, `reflect`, `list_banks`, `create_bank`, `list_mental_models`, `get_mental_model`, `create_mental_model`, `update_mental_model`, `delete_mental_model`, `refresh_mental_model`, `list_directives`, `create_directive`, `delete_directive`, `list_memories`, `get_memory`, `delete_memory`, `list_documents`, `get_document`, `delete_document`, `list_operations`, `get_operation`, `cancel_operation`, `list_tags`, `get_bank`, `get_bank_stats`, `update_bank`, `delete_bank`, `clear_memories`.
+
+This can also be overridden per bank via the [config API](#hierarchical-configuration):
+
+```bash
+# Restrict a specific bank to read-only MCP access
+curl -X PATCH http://localhost:8888/v1/default/banks/my-bank/config \
+  -H "Content-Type: application/json" \
+  -d '{"updates": {"mcp_enabled_tools": ["recall"]}}'
+```
+
+When a bank-level `mcp_enabled_tools` is set, tools not in the list return a clear error when invoked (they still appear in the tools list for MCP protocol compatibility).
 
 **MCP Authentication:**
 
@@ -982,6 +1009,7 @@ Configuration fields are categorized for security:
 1. **Configurable Fields** - Safe behavioral settings that can be customized per-bank:
    - Retention: `retain_chunk_size`, `retain_extraction_mode`, `retain_mission`, `retain_custom_instructions`
    - Observations: `enable_observations`, `observations_mission`
+   - MCP access control: `mcp_enabled_tools`
 
 2. **Credential Fields** - NEVER exposed or configurable via API:
    - API keys: `*_api_key` (all LLM API keys)
@@ -996,13 +1024,7 @@ Configuration fields are categorized for security:
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `HINDSIGHT_API_ENABLE_BANK_CONFIG_API` | Enable per-bank config API | `false` |
-
-**Important:** The bank config API is **disabled by default** for security. Enable it explicitly:
-
-```bash
-export HINDSIGHT_API_ENABLE_BANK_CONFIG_API=true
-```
+| `HINDSIGHT_API_ENABLE_BANK_CONFIG_API` | Enable per-bank config API | `true` |
 
 #### API Endpoints
 
