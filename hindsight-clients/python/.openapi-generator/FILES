@@ -9,6 +9,7 @@ hindsight_client_api/api/memory_api.py
 hindsight_client_api/api/mental_models_api.py
 hindsight_client_api/api/monitoring_api.py
 hindsight_client_api/api/operations_api.py
+hindsight_client_api/api/webhooks_api.py
 hindsight_client_api/api_client.py
 hindsight_client_api/api_response.py
 hindsight_client_api/configuration.py
@@ -35,6 +36,7 @@ hindsight_client_api/models/create_bank_request.py
 hindsight_client_api/models/create_directive_request.py
 hindsight_client_api/models/create_mental_model_request.py
 hindsight_client_api/models/create_mental_model_response.py
+hindsight_client_api/models/create_webhook_request.py
 hindsight_client_api/models/delete_document_response.py
 hindsight_client_api/models/delete_response.py
 hindsight_client_api/models/directive_list_response.py
@@ -60,6 +62,7 @@ hindsight_client_api/models/memory_item.py
 hindsight_client_api/models/mental_model_list_response.py
 hindsight_client_api/models/mental_model_response.py
 hindsight_client_api/models/mental_model_trigger.py
+hindsight_client_api/models/observation_scopes.py
 hindsight_client_api/models/operation_response.py
 hindsight_client_api/models/operation_status_response.py
 hindsight_client_api/models/operations_list_response.py
@@ -80,13 +83,22 @@ hindsight_client_api/models/retain_request.py
 hindsight_client_api/models/retain_response.py
 hindsight_client_api/models/source_facts_include_options.py
 hindsight_client_api/models/tag_item.py
+hindsight_client_api/models/timestamp.py
 hindsight_client_api/models/token_usage.py
 hindsight_client_api/models/tool_calls_include_options.py
 hindsight_client_api/models/update_directive_request.py
 hindsight_client_api/models/update_disposition_request.py
+hindsight_client_api/models/update_document_request.py
+hindsight_client_api/models/update_document_response.py
 hindsight_client_api/models/update_mental_model_request.py
+hindsight_client_api/models/update_webhook_request.py
 hindsight_client_api/models/validation_error.py
 hindsight_client_api/models/validation_error_loc_inner.py
 hindsight_client_api/models/version_response.py
+hindsight_client_api/models/webhook_delivery_list_response.py
+hindsight_client_api/models/webhook_delivery_response.py
+hindsight_client_api/models/webhook_http_config.py
+hindsight_client_api/models/webhook_list_response.py
+hindsight_client_api/models/webhook_response.py
 hindsight_client_api/rest.py
 hindsight_client_api_README.md

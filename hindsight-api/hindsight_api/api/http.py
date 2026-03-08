@@ -71,9 +71,7 @@ def FieldWithDefault(default_factory: Callable, **kwargs) -> Any:
 
 
 from hindsight_api.config import get_config
-from hindsight_api.engine.db_utils import acquire_with_retry
-from hindsight_api.engine.memory_engine import Budget, _get_tiktoken_encoding, fq_table
-from hindsight_api.engine.reflect.observations import Observation
+from hindsight_api.engine.memory_engine import Budget, _current_schema, _get_tiktoken_encoding, fq_table
 from hindsight_api.engine.response_models import VALID_RECALL_FACT_TYPES, MemoryFact, TokenUsage
 from hindsight_api.engine.search.tags import TagsMatch
 from hindsight_api.extensions import HttpExtension, OperationValidationError, load_extension
@@ -100,7 +98,12 @@ class ChunkIncludeOptions(BaseModel):
 class SourceFactsIncludeOptions(BaseModel):
     """Options for including source facts for observation-type results."""
 
-    max_tokens: int = Field(default=4096, description="Maximum tokens for source facts")
+    max_tokens: int = Field(
+        default=4096, description="Maximum total tokens for source facts across all observations (-1 = unlimited)"
+    )
+    max_tokens_per_observation: int = Field(
+        default=-1, description="Maximum tokens of source facts per observation (-1 = unlimited)"
+    )
 
 
 class IncludeOptions(BaseModel):
@@ -383,7 +386,15 @@ class MemoryItem(BaseModel):
     )
 
     content: str
-    timestamp: datetime | None = None
+    timestamp: datetime | str | None = Field(
+        default=None,
+        description=(
+            "When the content occurred. "
+            "Accepts an ISO 8601 datetime string (e.g. '2024-01-15T10:30:00Z'), null/omitted (defaults to now), "
+            "or the special string 'unset' to explicitly store without any timestamp "
+            "(use this for timeless content such as fictional documents or static reference material)."
+        ),
+    )
     context: str | None = None
     metadata: dict[str, str] | None = None
     document_id: str | None = Field(default=None, description="Optional document ID for this memory item.")
@@ -395,6 +406,16 @@ class MemoryItem(BaseModel):
         default=None,
         description="Optional tags for visibility scoping. Memories with tags can be filtered during recall.",
     )
+    observation_scopes: Literal["per_tag", "combined", "all_combinations"] | list[list[str]] | None = Field(
+        default=None,
+        title="ObservationScopes",
+        description=(
+            "How to scope observations during consolidation. "
+            "'per_tag' runs one consolidation pass per individual tag, creating separate observations for each tag. "
+            "'combined' (default) runs a single pass with all tags together. "
+            "A list of tag lists runs one pass per inner list, giving full control over which combinations to use."
+        ),
+    )
 
     @field_validator("timestamp", mode="before")
     @classmethod
@@ -404,12 +425,14 @@ class MemoryItem(BaseModel):
         if isinstance(v, datetime):
             return v
         if isinstance(v, str):
+            if v.lower() == "unset":
+                return "unset"
             try:
                 # Try parsing as ISO format
                 return datetime.fromisoformat(v.replace("Z", "+00:00"))
             except ValueError as e:
                 raise ValueError(
-                    f"Invalid timestamp/event_date format: '{v}'. Expected ISO format like '2024-01-15T10:30:00' or '2024-01-15T10:30:00Z'"
+                    f"Invalid timestamp/event_date format: '{v}'. Expected ISO format like '2024-01-15T10:30:00' or '2024-01-15T10:30:00Z', or the special value 'unset' to store without a timestamp."
                 ) from e
         raise ValueError(f"timestamp must be a string or datetime, got {type(v).__name__}")
 
@@ -454,6 +477,11 @@ class FileRetainMetadata(BaseModel):
     metadata: dict[str, Any] | None = Field(default=None, description="Additional metadata")
     tags: list[str] | None = Field(default=None, description="Tags for this file")
     timestamp: str | None = Field(default=None, description="ISO timestamp")
+    parser: str | list[str] | None = Field(
+        default=None,
+        description="Parser or ordered fallback chain for this file (overrides request-level parser). "
+        "E.g. 'iris' or ['iris', 'markitdown'].",
+    )
 
 
 class FileRetainRequest(BaseModel):
@@ -462,14 +490,21 @@ class FileRetainRequest(BaseModel):
     model_config = ConfigDict(
         json_schema_extra={
             "example": {
+                "parser": "iris",
                 "files_metadata": [
                     {"document_id": "report_2024", "tags": ["quarterly"]},
-                    {"context": "meeting notes"},
+                    {"context": "meeting notes", "parser": ["iris", "markitdown"]},
                 ],
             }
         }
     )
 
+    parser: str | list[str] | None = Field(
+        default=None,
+        description="Default parser or ordered fallback chain for all files in this request. "
+        "E.g. 'markitdown' or ['iris', 'markitdown']. Falls back to server default if not set. "
+        "Per-file 'parser' in files_metadata takes precedence over this value.",
+    )
     files_metadata: list[FileRetainMetadata] | None = Field(
         default=None,
         description="Metadata for each file (optional, must match number of files if provided)",
@@ -737,14 +772,6 @@ class ReflectResponse(BaseModel):
         default=None,
         description="Execution trace of tool and LLM calls. Only present when include.tool_calls is set.",
     )
-
-
-class BanksResponse(BaseModel):
-    """Response model for banks list endpoint."""
-
-    model_config = ConfigDict(json_schema_extra={"example": {"banks": ["user123", "bank_alice", "bank_bob"]}})
-
-    banks: list[str]
 
 
 class DispositionTraits(BaseModel):
@@ -1179,6 +1206,30 @@ class DocumentResponse(BaseModel):
     tags: list[str] = FieldWithDefault(list, description="Tags associated with this document")
 
 
+class UpdateDocumentRequest(BaseModel):
+    """Request model for updating a document's mutable fields."""
+
+    model_config = ConfigDict(
+        json_schema_extra={
+            "example": {
+                "tags": ["team-a", "team-b"],
+            }
+        }
+    )
+
+    tags: list[str] | None = Field(
+        default=None,
+        description="New tags for the document and its memory units. "
+        "Triggers observation invalidation and re-consolidation.",
+    )
+
+
+class UpdateDocumentResponse(BaseModel):
+    """Response model for update document endpoint."""
+
+    success: bool = True
+
+
 class DeleteDocumentResponse(BaseModel):
     """Response model for delete document endpoint."""
 
@@ -1283,15 +1334,6 @@ class BankStatsResponse(BaseModel):
 
 
 # Mental Model models
-
-
-class ObservationEvidenceResponse(BaseModel):
-    """A single piece of evidence supporting an observation."""
-
-    memory_id: str = Field(description="ID of the memory unit this evidence comes from")
-    quote: str = Field(description="Exact quote from the memory supporting the observation")
-    relevance: str = Field(description="Brief explanation of how this quote supports the observation")
-    timestamp: str = Field(description="When the source memory was created (ISO format)")
 
 
 # =========================================================================
@@ -1607,6 +1649,123 @@ class VersionResponse(BaseModel):
     features: FeaturesInfo = Field(description="Enabled feature flags")
 
 
+# =========================================================================
+# Webhook Models
+# =========================================================================
+
+
+from hindsight_api.webhooks.models import WebhookHttpConfig
+
+
+class CreateWebhookRequest(BaseModel):
+    """Request model for registering a webhook."""
+
+    url: str = Field(description="HTTP(S) endpoint URL to deliver events to")
+    secret: str | None = Field(default=None, description="HMAC-SHA256 signing secret (optional)")
+    event_types: list[str] = Field(
+        default=["consolidation.completed"],
+        description="List of event types to deliver. Currently supported: 'consolidation.completed'",
+    )
+    enabled: bool = Field(default=True, description="Whether this webhook is active")
+    http_config: WebhookHttpConfig = Field(
+        default_factory=WebhookHttpConfig,
+        description="HTTP delivery configuration (method, timeout, headers, params)",
+    )
+
+
+class WebhookResponse(BaseModel):
+    """Response model for a webhook."""
+
+    id: str
+    bank_id: str | None
+    url: str
+    secret: str | None = Field(default=None, description="Signing secret (redacted in responses)")
+    event_types: list[str]
+    enabled: bool
+    http_config: WebhookHttpConfig = Field(default_factory=WebhookHttpConfig)
+    created_at: str | None = None
+    updated_at: str | None = None
+
+
+class UpdateWebhookRequest(BaseModel):
+    """Request model for updating a webhook. Only provided fields are updated."""
+
+    url: str | None = Field(default=None, description="HTTP(S) endpoint URL")
+    secret: str | None = Field(
+        default=None, description="HMAC-SHA256 signing secret. Omit to keep existing; send null to clear."
+    )
+    event_types: list[str] | None = Field(default=None, description="List of event types")
+    enabled: bool | None = Field(default=None, description="Whether this webhook is active")
+    http_config: WebhookHttpConfig | None = Field(default=None, description="HTTP delivery configuration")
+
+
+class WebhookListResponse(BaseModel):
+    """Response model for listing webhooks."""
+
+    items: list[WebhookResponse]
+
+
+class WebhookDeliveryResponse(BaseModel):
+    """Response model for a webhook delivery record."""
+
+    id: str
+    webhook_id: str | None
+    url: str
+    event_type: str
+    status: str
+    attempts: int
+    next_retry_at: str | None = None
+    last_error: str | None = None
+    last_response_status: int | None = None
+    last_response_body: str | None = None
+    last_attempt_at: str | None = None
+    created_at: str | None = None
+    updated_at: str | None = None
+
+    @classmethod
+    def from_async_operation_row(cls, row: dict) -> "WebhookDeliveryResponse":
+        import json as _json
+
+        raw = row["task_payload"]
+        if isinstance(raw, str):
+            task_payload = _json.loads(raw)
+        elif isinstance(raw, dict):
+            task_payload = raw
+        else:
+            task_payload = {}
+
+        raw_meta = row.get("result_metadata")
+        if isinstance(raw_meta, str):
+            result_metadata = _json.loads(raw_meta) if raw_meta else {}
+        elif isinstance(raw_meta, dict):
+            result_metadata = raw_meta
+        else:
+            result_metadata = {}
+
+        return cls(
+            id=str(row["operation_id"]),
+            webhook_id=task_payload.get("webhook_id"),
+            url=task_payload.get("url", ""),
+            event_type=task_payload.get("event_type", ""),
+            status=row["status"],
+            attempts=row["retry_count"] + 1,
+            next_retry_at=row["next_retry_at"],
+            last_error=row["error_message"],
+            last_response_status=result_metadata.get("last_status_code"),
+            last_response_body=result_metadata.get("last_response_body"),
+            last_attempt_at=result_metadata.get("last_attempt_at"),
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+        )
+
+
+class WebhookDeliveryListResponse(BaseModel):
+    """Response model for listing webhook deliveries."""
+
+    items: list[WebhookDeliveryResponse]
+    next_cursor: str | None = None
+
+
 def create_app(
     memory: MemoryEngine,
     initialize_memory: bool = True,
@@ -1706,7 +1865,6 @@ def create_app(
                 worker_id=worker_id,
                 executor=memory.execute_task,
                 poll_interval_ms=config.worker_poll_interval_ms,
-                max_retries=config.worker_max_retries,
                 schema=schema,
                 tenant_extension=memory._tenant_extension,
                 max_slots=config.worker_max_slots,
@@ -1809,6 +1967,12 @@ def create_app(
         extension_router = http_extension.get_router(memory)
         app.include_router(extension_router, prefix="/ext", tags=["Extension"])
         logging.info("HTTP extension router mounted at /ext/")
+
+        # Mount root router if provided (for well-known endpoints, etc.)
+        root_router = http_extension.get_root_router(memory)
+        if root_router:
+            app.include_router(root_router)
+            logging.info("HTTP extension root router mounted")
 
     return app
 
@@ -1933,6 +2097,8 @@ def _register_routes(app: FastAPI):
                 bank_id, type, limit=limit, q=q, tags=tags, tags_match=tags_match, request_context=request_context
             )
             return data
+        except OperationValidationError as e:
+            raise HTTPException(status_code=e.status_code, detail=e.reason)
         except (AuthenticationError, HTTPException):
             raise
         except Exception as e:
@@ -1981,6 +2147,8 @@ def _register_routes(app: FastAPI):
                 request_context=request_context,
             )
             return data
+        except OperationValidationError as e:
+            raise HTTPException(status_code=e.status_code, detail=e.reason)
         except (AuthenticationError, HTTPException):
             raise
         except Exception as e:
@@ -1993,7 +2161,7 @@ def _register_routes(app: FastAPI):
     @app.get(
         "/v1/default/banks/{bank_id}/memories/{memory_id}",
         summary="Get memory unit",
-        description="Get a single memory unit by ID with all its metadata including entities and tags.",
+        description="Get a single memory unit by ID with all its metadata including entities and tags. Note: the 'history' field is deprecated and always returns an empty list - use GET /memories/{memory_id}/history instead.",
         operation_id="get_memory",
         tags=["Memory"],
     )
@@ -2012,6 +2180,8 @@ def _register_routes(app: FastAPI):
             if data is None:
                 raise HTTPException(status_code=404, detail=f"Memory unit '{memory_id}' not found")
             return data
+        except OperationValidationError as e:
+            raise HTTPException(status_code=e.status_code, detail=e.reason)
         except (AuthenticationError, HTTPException):
             raise
         except Exception as e:
@@ -2019,6 +2189,39 @@ def _register_routes(app: FastAPI):
 
             error_detail = f"{str(e)}\n\nTraceback:\n{traceback.format_exc()}"
             logger.error(f"Error in /v1/default/banks/{bank_id}/memories/{memory_id}: {error_detail}")
+            raise HTTPException(status_code=500, detail=str(e))
+
+    @app.get(
+        "/v1/default/banks/{bank_id}/memories/{memory_id}/history",
+        summary="Get observation history",
+        description="Get the full history of an observation, with each change's source facts resolved to their text.",
+        operation_id="get_observation_history",
+        tags=["Memory"],
+    )
+    async def api_get_observation_history(
+        bank_id: str,
+        memory_id: str,
+        request_context: RequestContext = Depends(get_request_context),
+    ):
+        """Get the history of a single observation by ID."""
+        try:
+            data = await app.state.memory.get_observation_history(
+                bank_id=bank_id,
+                memory_id=memory_id,
+                request_context=request_context,
+            )
+            if data is None:
+                raise HTTPException(status_code=404, detail=f"Memory unit '{memory_id}' not found")
+            return data
+        except OperationValidationError as e:
+            raise HTTPException(status_code=e.status_code, detail=e.reason)
+        except (AuthenticationError, HTTPException):
+            raise
+        except Exception as e:
+            import traceback
+
+            error_detail = f"{str(e)}\n\nTraceback:\n{traceback.format_exc()}"
+            logger.error(f"Error in /v1/default/banks/{bank_id}/memories/{memory_id}/history: {error_detail}")
             raise HTTPException(status_code=500, detail=str(e))
 
     @app.post(
@@ -2076,6 +2279,9 @@ def _register_routes(app: FastAPI):
             # Determine source facts inclusion settings
             include_source_facts = request.include.source_facts is not None
             max_source_facts_tokens = request.include.source_facts.max_tokens if include_source_facts else 4096
+            max_source_facts_tokens_per_observation = (
+                request.include.source_facts.max_tokens_per_observation if include_source_facts else -1
+            )
 
             pre_recall = time.time() - handler_start
             # Run recall with tracing (record metrics)
@@ -2097,6 +2303,7 @@ def _register_routes(app: FastAPI):
                     max_chunk_tokens=max_chunk_tokens,
                     include_source_facts=include_source_facts,
                     max_source_facts_tokens=max_source_facts_tokens,
+                    max_source_facts_tokens_per_observation=max_source_facts_tokens_per_observation,
                     request_context=request_context,
                     tags=request.tags,
                     tags_match=request.tags_match,
@@ -2353,141 +2560,34 @@ def _register_routes(app: FastAPI):
     ):
         """Get statistics about memory nodes and links for a memory bank."""
         try:
-            # Authenticate and set tenant schema
-            await app.state.memory._authenticate_tenant(request_context)
-            pool = await app.state.memory._get_pool()
-            async with acquire_with_retry(pool) as conn:
-                # Get node counts by fact_type
-                node_stats = await conn.fetch(
-                    f"""
-                    SELECT fact_type, COUNT(*) as count
-                    FROM {fq_table("memory_units")}
-                    WHERE bank_id = $1
-                    GROUP BY fact_type
-                    """,
-                    bank_id,
-                )
-
-                # Get link counts by link_type
-                link_stats = await conn.fetch(
-                    f"""
-                    SELECT ml.link_type, COUNT(*) as count
-                    FROM {fq_table("memory_links")} ml
-                    JOIN {fq_table("memory_units")} mu ON ml.from_unit_id = mu.id
-                    WHERE mu.bank_id = $1
-                    GROUP BY ml.link_type
-                    """,
-                    bank_id,
-                )
-
-                # Get link counts by fact_type (from nodes)
-                link_fact_type_stats = await conn.fetch(
-                    f"""
-                    SELECT mu.fact_type, COUNT(*) as count
-                    FROM {fq_table("memory_links")} ml
-                    JOIN {fq_table("memory_units")} mu ON ml.from_unit_id = mu.id
-                    WHERE mu.bank_id = $1
-                    GROUP BY mu.fact_type
-                    """,
-                    bank_id,
-                )
-
-                # Get link counts by fact_type AND link_type
-                link_breakdown_stats = await conn.fetch(
-                    f"""
-                    SELECT mu.fact_type, ml.link_type, COUNT(*) as count
-                    FROM {fq_table("memory_links")} ml
-                    JOIN {fq_table("memory_units")} mu ON ml.from_unit_id = mu.id
-                    WHERE mu.bank_id = $1
-                    GROUP BY mu.fact_type, ml.link_type
-                    """,
-                    bank_id,
-                )
-
-                # Get pending and failed operations counts
-                ops_stats = await conn.fetch(
-                    f"""
-                    SELECT status, COUNT(*) as count
-                    FROM {fq_table("async_operations")}
-                    WHERE bank_id = $1
-                    GROUP BY status
-                    """,
-                    bank_id,
-                )
-                ops_by_status = {row["status"]: row["count"] for row in ops_stats}
-                pending_operations = ops_by_status.get("pending", 0)
-                failed_operations = ops_by_status.get("failed", 0)
-
-                # Get document count
-                doc_count_result = await conn.fetchrow(
-                    f"""
-                    SELECT COUNT(*) as count
-                    FROM {fq_table("documents")}
-                    WHERE bank_id = $1
-                    """,
-                    bank_id,
-                )
-                total_documents = doc_count_result["count"] if doc_count_result else 0
-
-                # Get consolidation stats from memory-level tracking
-                consolidation_stats = await conn.fetchrow(
-                    f"""
-                    SELECT
-                        MAX(consolidated_at) as last_consolidated_at,
-                        COUNT(*) FILTER (WHERE consolidated_at IS NULL AND fact_type IN ('experience', 'world')) as pending
-                    FROM {fq_table("memory_units")}
-                    WHERE bank_id = $1
-                    """,
-                    bank_id,
-                )
-                last_consolidated_at = consolidation_stats["last_consolidated_at"] if consolidation_stats else None
-                pending_consolidation = consolidation_stats["pending"] if consolidation_stats else 0
-
-                # Count total observations (consolidated knowledge)
-                observation_count_result = await conn.fetchrow(
-                    f"""
-                    SELECT COUNT(*) as count
-                    FROM {fq_table("memory_units")}
-                    WHERE bank_id = $1 AND fact_type = 'observation'
-                    """,
-                    bank_id,
-                )
-                total_observations = observation_count_result["count"] if observation_count_result else 0
-
-                # Format results
-                nodes_by_type = {row["fact_type"]: row["count"] for row in node_stats}
-                links_by_type = {row["link_type"]: row["count"] for row in link_stats}
-                links_by_fact_type = {row["fact_type"]: row["count"] for row in link_fact_type_stats}
-
-                # Build detailed breakdown: {fact_type: {link_type: count}}
-                links_breakdown = {}
-                for row in link_breakdown_stats:
-                    fact_type = row["fact_type"]
-                    link_type = row["link_type"]
-                    count = row["count"]
-                    if fact_type not in links_breakdown:
-                        links_breakdown[fact_type] = {}
-                    links_breakdown[fact_type][link_type] = count
-
-                total_nodes = sum(nodes_by_type.values())
-                total_links = sum(links_by_type.values())
-
-                return BankStatsResponse(
-                    bank_id=bank_id,
-                    total_nodes=total_nodes,
-                    total_links=total_links,
-                    total_documents=total_documents,
-                    nodes_by_fact_type=nodes_by_type,
-                    links_by_link_type=links_by_type,
-                    links_by_fact_type=links_by_fact_type,
-                    links_breakdown=links_breakdown,
-                    pending_operations=pending_operations,
-                    failed_operations=failed_operations,
-                    last_consolidated_at=(last_consolidated_at.isoformat() if last_consolidated_at else None),
-                    pending_consolidation=pending_consolidation,
-                    total_observations=total_observations,
-                )
-
+            stats = await app.state.memory.get_bank_stats(bank_id, request_context=request_context)
+            nodes_by_type = stats["node_counts"]
+            links_by_type = stats["link_counts"]
+            links_by_fact_type = stats["link_counts_by_fact_type"]
+            links_breakdown: dict[str, dict[str, int]] = {}
+            for row in stats["link_breakdown"]:
+                ft = row["fact_type"]
+                if ft not in links_breakdown:
+                    links_breakdown[ft] = {}
+                links_breakdown[ft][row["link_type"]] = row["count"]
+            ops = stats["operations"]
+            return BankStatsResponse(
+                bank_id=bank_id,
+                total_nodes=sum(nodes_by_type.values()),
+                total_links=sum(links_by_type.values()),
+                total_documents=stats["total_documents"],
+                nodes_by_fact_type=nodes_by_type,
+                links_by_link_type=links_by_type,
+                links_by_fact_type=links_by_fact_type,
+                links_breakdown=links_breakdown,
+                pending_operations=ops.get("pending", 0),
+                failed_operations=ops.get("failed", 0),
+                last_consolidated_at=stats["last_consolidated_at"],
+                pending_consolidation=stats["pending_consolidation"],
+                total_observations=stats["total_observations"],
+            )
+        except OperationValidationError as e:
+            raise HTTPException(status_code=e.status_code, detail=e.reason)
         except (AuthenticationError, HTTPException):
             raise
         except Exception as e:
@@ -2522,6 +2622,8 @@ def _register_routes(app: FastAPI):
                 limit=data["limit"],
                 offset=data["offset"],
             )
+        except OperationValidationError as e:
+            raise HTTPException(status_code=e.status_code, detail=e.reason)
         except (AuthenticationError, HTTPException):
             raise
         except Exception as e:
@@ -2561,6 +2663,8 @@ def _register_routes(app: FastAPI):
                     for obs in entity["observations"]
                 ],
             )
+        except OperationValidationError as e:
+            raise HTTPException(status_code=e.status_code, detail=e.reason)
         except (AuthenticationError, HTTPException):
             raise
         except Exception as e:
@@ -2622,6 +2726,8 @@ def _register_routes(app: FastAPI):
                 request_context=request_context,
             )
             return MentalModelListResponse(items=[MentalModelResponse(**m) for m in mental_models])
+        except OperationValidationError as e:
+            raise HTTPException(status_code=e.status_code, detail=e.reason)
         except (AuthenticationError, HTTPException):
             raise
         except Exception as e:
@@ -2664,6 +2770,41 @@ def _register_routes(app: FastAPI):
 
             error_detail = f"{str(e)}\n\nTraceback:\n{traceback.format_exc()}"
             logger.error(f"Error in GET /v1/default/banks/{bank_id}/mental-models/{mental_model_id}: {error_detail}")
+            raise HTTPException(status_code=500, detail=str(e))
+
+    @app.get(
+        "/v1/default/banks/{bank_id}/mental-models/{mental_model_id}/history",
+        summary="Get mental model history",
+        description="Get the refresh history of a mental model, showing content changes over time.",
+        operation_id="get_mental_model_history",
+        tags=["Mental Models"],
+    )
+    async def api_get_mental_model_history(
+        bank_id: str,
+        mental_model_id: str,
+        request_context: RequestContext = Depends(get_request_context),
+    ):
+        """Get the refresh history of a mental model."""
+        try:
+            data = await app.state.memory.get_mental_model_history(
+                bank_id=bank_id,
+                mental_model_id=mental_model_id,
+                request_context=request_context,
+            )
+            if data is None:
+                raise HTTPException(status_code=404, detail=f"Mental model '{mental_model_id}' not found")
+            return data
+        except (AuthenticationError, HTTPException):
+            raise
+        except OperationValidationError as e:
+            raise HTTPException(status_code=e.status_code, detail=e.reason)
+        except Exception as e:
+            import traceback
+
+            error_detail = f"{str(e)}\n\nTraceback:\n{traceback.format_exc()}"
+            logger.error(
+                f"Error in GET /v1/default/banks/{bank_id}/mental-models/{mental_model_id}/history: {error_detail}"
+            )
             raise HTTPException(status_code=500, detail=str(e))
 
     @app.post(
@@ -2780,6 +2921,8 @@ def _register_routes(app: FastAPI):
             if mental_model is None:
                 raise HTTPException(status_code=404, detail=f"Mental model '{mental_model_id}' not found")
             return MentalModelResponse(**mental_model)
+        except OperationValidationError as e:
+            raise HTTPException(status_code=e.status_code, detail=e.reason)
         except (AuthenticationError, HTTPException):
             raise
         except Exception as e:
@@ -2811,6 +2954,8 @@ def _register_routes(app: FastAPI):
             if not deleted:
                 raise HTTPException(status_code=404, detail=f"Mental model '{mental_model_id}' not found")
             return {"status": "deleted"}
+        except OperationValidationError as e:
+            raise HTTPException(status_code=e.status_code, detail=e.reason)
         except (AuthenticationError, HTTPException):
             raise
         except Exception as e:
@@ -2853,6 +2998,8 @@ def _register_routes(app: FastAPI):
                 request_context=request_context,
             )
             return DirectiveListResponse(items=[DirectiveResponse(**d) for d in directives])
+        except OperationValidationError as e:
+            raise HTTPException(status_code=e.status_code, detail=e.reason)
         except (AuthenticationError, HTTPException):
             raise
         except Exception as e:
@@ -2885,6 +3032,8 @@ def _register_routes(app: FastAPI):
             if directive is None:
                 raise HTTPException(status_code=404, detail=f"Directive '{directive_id}' not found")
             return DirectiveResponse(**directive)
+        except OperationValidationError as e:
+            raise HTTPException(status_code=e.status_code, detail=e.reason)
         except (AuthenticationError, HTTPException):
             raise
         except Exception as e:
@@ -2921,6 +3070,8 @@ def _register_routes(app: FastAPI):
             return DirectiveResponse(**directive)
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e))
+        except OperationValidationError as e:
+            raise HTTPException(status_code=e.status_code, detail=e.reason)
         except (AuthenticationError, HTTPException):
             raise
         except Exception as e:
@@ -2959,6 +3110,8 @@ def _register_routes(app: FastAPI):
             if directive is None:
                 raise HTTPException(status_code=404, detail=f"Directive '{directive_id}' not found")
             return DirectiveResponse(**directive)
+        except OperationValidationError as e:
+            raise HTTPException(status_code=e.status_code, detail=e.reason)
         except (AuthenticationError, HTTPException):
             raise
         except Exception as e:
@@ -2990,6 +3143,8 @@ def _register_routes(app: FastAPI):
             if not deleted:
                 raise HTTPException(status_code=404, detail=f"Directive '{directive_id}' not found")
             return {"status": "deleted"}
+        except OperationValidationError as e:
+            raise HTTPException(status_code=e.status_code, detail=e.reason)
         except (AuthenticationError, HTTPException):
             raise
         except Exception as e:
@@ -3009,7 +3164,13 @@ def _register_routes(app: FastAPI):
     )
     async def api_list_documents(
         bank_id: str,
-        q: str | None = None,
+        q: str | None = Query(
+            None, description="Case-insensitive substring filter on document ID (e.g. 'report' matches 'report-2024')"
+        ),
+        tags: list[str] | None = Query(None, description="Filter documents by tags"),
+        tags_match: str = Query(
+            "any_strict", description="How to match tags: 'any', 'all', 'any_strict', 'all_strict'"
+        ),
         limit: int = 100,
         offset: int = 0,
         request_context: RequestContext = Depends(get_request_context),
@@ -3019,15 +3180,25 @@ def _register_routes(app: FastAPI):
 
         Args:
             bank_id: Memory Bank ID (from path)
-            q: Search query (searches document ID and metadata)
+            q: Case-insensitive substring filter on document ID
+            tags: Filter documents by tags
+            tags_match: How to match tags (any, all, any_strict, all_strict)
             limit: Maximum number of results (default: 100)
             offset: Offset for pagination (default: 0)
         """
         try:
             data = await app.state.memory.list_documents(
-                bank_id=bank_id, search_query=q, limit=limit, offset=offset, request_context=request_context
+                bank_id=bank_id,
+                search_query=q,
+                tags=tags,
+                tags_match=tags_match,
+                limit=limit,
+                offset=offset,
+                request_context=request_context,
             )
             return data
+        except OperationValidationError as e:
+            raise HTTPException(status_code=e.status_code, detail=e.reason)
         except (AuthenticationError, HTTPException):
             raise
         except Exception as e:
@@ -3060,6 +3231,8 @@ def _register_routes(app: FastAPI):
             if not document:
                 raise HTTPException(status_code=404, detail="Document not found")
             return document
+        except OperationValidationError as e:
+            raise HTTPException(status_code=e.status_code, detail=e.reason)
         except (AuthenticationError, HTTPException):
             raise
         except Exception as e:
@@ -3113,6 +3286,8 @@ def _register_routes(app: FastAPI):
                 request_context=request_context,
             )
             return data
+        except OperationValidationError as e:
+            raise HTTPException(status_code=e.status_code, detail=e.reason)
         except (AuthenticationError, HTTPException):
             raise
         except Exception as e:
@@ -3142,6 +3317,8 @@ def _register_routes(app: FastAPI):
             if not chunk:
                 raise HTTPException(status_code=404, detail="Chunk not found")
             return chunk
+        except OperationValidationError as e:
+            raise HTTPException(status_code=e.status_code, detail=e.reason)
         except (AuthenticationError, HTTPException):
             raise
         except Exception as e:
@@ -3149,6 +3326,55 @@ def _register_routes(app: FastAPI):
 
             error_detail = f"{str(e)}\n\nTraceback:\n{traceback.format_exc()}"
             logger.error(f"Error in /v1/default/chunks/{chunk_id}: {error_detail}")
+            raise HTTPException(status_code=500, detail=str(e))
+
+    @app.patch(
+        "/v1/default/banks/{bank_id}/documents/{document_id:path}",
+        response_model=UpdateDocumentResponse,
+        summary="Update document",
+        description="Update mutable fields on a document without re-processing its content.\n\n"
+        "**Tags** (`tags`): Propagated to all associated memory units. Observations derived from "
+        "those units are invalidated and queued for re-consolidation under the new tags. "
+        "Co-source memories from other documents that shared those observations are also reset.\n\n"
+        "At least one field must be provided.",
+        operation_id="update_document",
+        tags=["Documents"],
+    )
+    async def api_update_document(
+        bank_id: str,
+        document_id: str,
+        body: UpdateDocumentRequest,
+        request_context: RequestContext = Depends(get_request_context),
+    ):
+        """
+        Update mutable fields on a document without re-processing its content.
+
+        Args:
+            bank_id: Memory Bank ID (from path)
+            document_id: Document ID (from path)
+            body: Fields to update (tags, metadata, context)
+        """
+        if body.tags is None:
+            raise HTTPException(status_code=422, detail="At least one field (tags) must be provided")
+        try:
+            result = await app.state.memory.update_document(
+                document_id,
+                bank_id,
+                tags=body.tags,
+                request_context=request_context,
+            )
+            if not result:
+                raise HTTPException(status_code=404, detail="Document not found")
+            return UpdateDocumentResponse(success=True)
+        except OperationValidationError as e:
+            raise HTTPException(status_code=e.status_code, detail=e.reason)
+        except (AuthenticationError, HTTPException):
+            raise
+        except Exception as e:
+            import traceback
+
+            error_detail = f"{str(e)}\n\nTraceback:\n{traceback.format_exc()}"
+            logger.error(f"Error in PATCH /v1/default/banks/{bank_id}/documents/{document_id}: {error_detail}")
             raise HTTPException(status_code=500, detail=str(e))
 
     @app.delete(
@@ -3186,6 +3412,8 @@ def _register_routes(app: FastAPI):
                 document_id=document_id,
                 memory_units_deleted=result["memory_units_deleted"],
             )
+        except OperationValidationError as e:
+            raise HTTPException(status_code=e.status_code, detail=e.reason)
         except (AuthenticationError, HTTPException):
             raise
         except Exception as e:
@@ -3222,6 +3450,8 @@ def _register_routes(app: FastAPI):
                 offset=offset,
                 operations=[OperationResponse(**op) for op in result["operations"]],
             )
+        except OperationValidationError as e:
+            raise HTTPException(status_code=e.status_code, detail=e.reason)
         except (AuthenticationError, HTTPException):
             raise
         except Exception as e:
@@ -3253,6 +3483,8 @@ def _register_routes(app: FastAPI):
 
             result = await app.state.memory.get_operation_status(bank_id, operation_id, request_context=request_context)
             return OperationStatusResponse(**result)
+        except OperationValidationError as e:
+            raise HTTPException(status_code=e.status_code, detail=e.reason)
         except (AuthenticationError, HTTPException):
             raise
         except Exception as e:
@@ -3285,6 +3517,8 @@ def _register_routes(app: FastAPI):
             return CancelOperationResponse(**result)
         except ValueError as e:
             raise HTTPException(status_code=404, detail=str(e))
+        except OperationValidationError as e:
+            raise HTTPException(status_code=e.status_code, detail=e.reason)
         except (AuthenticationError, HTTPException):
             raise
         except Exception as e:
@@ -3321,6 +3555,8 @@ def _register_routes(app: FastAPI):
                 mission=mission,
                 background=mission,  # Backwards compat
             )
+        except OperationValidationError as e:
+            raise HTTPException(status_code=e.status_code, detail=e.reason)
         except (AuthenticationError, HTTPException):
             raise
         except Exception as e:
@@ -3364,6 +3600,8 @@ def _register_routes(app: FastAPI):
                 mission=mission,
                 background=mission,  # Backwards compat
             )
+        except OperationValidationError as e:
+            raise HTTPException(status_code=e.status_code, detail=e.reason)
         except (AuthenticationError, HTTPException):
             raise
         except Exception as e:
@@ -3392,6 +3630,8 @@ def _register_routes(app: FastAPI):
             )
             mission = result.get("mission") or ""
             return BackgroundResponse(mission=mission, background=mission)
+        except OperationValidationError as e:
+            raise HTTPException(status_code=e.status_code, detail=e.reason)
         except (AuthenticationError, HTTPException):
             raise
         except Exception as e:
@@ -3445,6 +3685,8 @@ def _register_routes(app: FastAPI):
                 mission=mission,
                 background=mission,  # Backwards compat
             )
+        except OperationValidationError as e:
+            raise HTTPException(status_code=e.status_code, detail=e.reason)
         except (AuthenticationError, HTTPException):
             raise
         except Exception as e:
@@ -3498,6 +3740,8 @@ def _register_routes(app: FastAPI):
                 mission=mission,
                 background=mission,  # Backwards compat
             )
+        except OperationValidationError as e:
+            raise HTTPException(status_code=e.status_code, detail=e.reason)
         except (AuthenticationError, HTTPException):
             raise
         except Exception as e:
@@ -3527,6 +3771,8 @@ def _register_routes(app: FastAPI):
                 + result.get("entities_deleted", 0)
                 + result.get("documents_deleted", 0),
             )
+        except OperationValidationError as e:
+            raise HTTPException(status_code=e.status_code, detail=e.reason)
         except (AuthenticationError, HTTPException):
             raise
         except Exception as e:
@@ -3553,6 +3799,8 @@ def _register_routes(app: FastAPI):
                 message=f"Cleared {result.get('deleted_count', 0)} observations",
                 deleted_count=result.get("deleted_count", 0),
             )
+        except OperationValidationError as e:
+            raise HTTPException(status_code=e.status_code, detail=e.reason)
         except (AuthenticationError, HTTPException):
             raise
         except Exception as e:
@@ -3585,6 +3833,8 @@ def _register_routes(app: FastAPI):
                 request_context=request_context,
             )
             return ClearMemoryObservationsResponse(deleted_count=result["deleted_count"])
+        except OperationValidationError as e:
+            raise HTTPException(status_code=e.status_code, detail=e.reason)
         except (AuthenticationError, HTTPException):
             raise
         except Exception as e:
@@ -3615,6 +3865,13 @@ def _register_routes(app: FastAPI):
         try:
             # Authenticate and set schema context for multi-tenant DB queries
             await app.state.memory._authenticate_tenant(request_context)
+            if app.state.memory._operation_validator:
+                from hindsight_api.extensions import BankReadContext
+
+                ctx = BankReadContext(bank_id=bank_id, operation="get_bank_config", request_context=request_context)
+                await app.state.memory._validate_operation(
+                    app.state.memory._operation_validator.validate_bank_read(ctx)
+                )
 
             # Get resolved config from config resolver
             config_dict = await app.state.memory._config_resolver.get_bank_config(bank_id, request_context)
@@ -3623,6 +3880,8 @@ def _register_routes(app: FastAPI):
             bank_overrides = await app.state.memory._config_resolver._load_bank_config(bank_id)
 
             return BankConfigResponse(bank_id=bank_id, config=config_dict, overrides=bank_overrides)
+        except OperationValidationError as e:
+            raise HTTPException(status_code=e.status_code, detail=e.reason)
         except (AuthenticationError, HTTPException):
             raise
         except Exception as e:
@@ -3653,6 +3912,13 @@ def _register_routes(app: FastAPI):
         try:
             # Authenticate and set schema context for multi-tenant DB queries
             await app.state.memory._authenticate_tenant(request_context)
+            if app.state.memory._operation_validator:
+                from hindsight_api.extensions import BankWriteContext
+
+                ctx = BankWriteContext(bank_id=bank_id, operation="update_bank_config", request_context=request_context)
+                await app.state.memory._validate_operation(
+                    app.state.memory._operation_validator.validate_bank_write(ctx)
+                )
 
             # Update config via config resolver (validates configurable fields and permissions)
             await app.state.memory._config_resolver.update_bank_config(bank_id, request.updates, request_context)
@@ -3662,6 +3928,8 @@ def _register_routes(app: FastAPI):
             bank_overrides = await app.state.memory._config_resolver._load_bank_config(bank_id)
 
             return BankConfigResponse(bank_id=bank_id, config=config_dict, overrides=bank_overrides)
+        except OperationValidationError as e:
+            raise HTTPException(status_code=e.status_code, detail=e.reason)
         except ValueError as e:
             # Validation error (e.g., trying to override static field)
             raise HTTPException(status_code=400, detail=str(e))
@@ -3693,6 +3961,13 @@ def _register_routes(app: FastAPI):
         try:
             # Authenticate and set schema context for multi-tenant DB queries
             await app.state.memory._authenticate_tenant(request_context)
+            if app.state.memory._operation_validator:
+                from hindsight_api.extensions import BankWriteContext
+
+                ctx = BankWriteContext(bank_id=bank_id, operation="reset_bank_config", request_context=request_context)
+                await app.state.memory._validate_operation(
+                    app.state.memory._operation_validator.validate_bank_write(ctx)
+                )
 
             # Reset config via config resolver
             await app.state.memory._config_resolver.reset_bank_config(bank_id)
@@ -3702,6 +3977,8 @@ def _register_routes(app: FastAPI):
             bank_overrides = await app.state.memory._config_resolver._load_bank_config(bank_id)
 
             return BankConfigResponse(bank_id=bank_id, config=config_dict, overrides=bank_overrides)
+        except OperationValidationError as e:
+            raise HTTPException(status_code=e.status_code, detail=e.reason)
         except (AuthenticationError, HTTPException):
             raise
         except Exception as e:
@@ -3727,6 +4004,8 @@ def _register_routes(app: FastAPI):
                 operation_id=result["operation_id"],
                 deduplicated=result.get("deduplicated", False),
             )
+        except OperationValidationError as e:
+            raise HTTPException(status_code=e.status_code, detail=e.reason)
         except (AuthenticationError, HTTPException):
             raise
         except Exception as e:
@@ -3734,6 +4013,318 @@ def _register_routes(app: FastAPI):
 
             error_detail = f"{str(e)}\n\nTraceback:\n{traceback.format_exc()}"
             logger.error(f"Error in POST /v1/default/banks/{bank_id}/consolidate: {error_detail}")
+            raise HTTPException(status_code=500, detail=str(e))
+
+    # =========================================================================
+    # Webhook Endpoints
+    # =========================================================================
+
+    @app.post(
+        "/v1/default/banks/{bank_id}/webhooks",
+        response_model=WebhookResponse,
+        summary="Register webhook",
+        description="Register a webhook endpoint to receive event notifications for this bank.",
+        operation_id="create_webhook",
+        tags=["Webhooks"],
+        status_code=201,
+    )
+    async def api_create_webhook(
+        bank_id: str,
+        request: CreateWebhookRequest,
+        request_context: RequestContext = Depends(get_request_context),
+    ):
+        """Register a webhook for a bank."""
+        try:
+            pool = await app.state.memory._get_pool()
+            from hindsight_api.engine.memory_engine import fq_table
+
+            webhook_id = uuid.uuid4()
+            now = datetime.utcnow().isoformat() + "Z"
+            row = await pool.fetchrow(
+                f"""
+                INSERT INTO {fq_table("webhooks")}
+                (id, bank_id, url, secret, event_types, enabled, http_config, created_at, updated_at)
+                VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, NOW(), NOW())
+                RETURNING id, bank_id, url, secret, event_types, enabled,
+                          http_config::text, created_at::text, updated_at::text
+                """,
+                webhook_id,
+                bank_id,
+                request.url,
+                request.secret,
+                request.event_types,
+                request.enabled,
+                request.http_config.model_dump_json(),
+            )
+            return WebhookResponse(
+                id=str(row["id"]),
+                bank_id=row["bank_id"],
+                url=row["url"],
+                secret=None,  # Never return secret in responses
+                event_types=list(row["event_types"]) if row["event_types"] else [],
+                enabled=row["enabled"],
+                http_config=WebhookHttpConfig.model_validate_json(row["http_config"])
+                if row["http_config"]
+                else WebhookHttpConfig(),
+                created_at=row["created_at"],
+                updated_at=row["updated_at"],
+            )
+        except (AuthenticationError, HTTPException):
+            raise
+        except Exception as e:
+            import traceback
+
+            error_detail = f"{str(e)}\n\nTraceback:\n{traceback.format_exc()}"
+            logger.error(f"Error in POST /v1/default/banks/{bank_id}/webhooks: {error_detail}")
+            raise HTTPException(status_code=500, detail=str(e))
+
+    @app.get(
+        "/v1/default/banks/{bank_id}/webhooks",
+        response_model=WebhookListResponse,
+        summary="List webhooks",
+        description="List all webhooks registered for a bank.",
+        operation_id="list_webhooks",
+        tags=["Webhooks"],
+    )
+    async def api_list_webhooks(
+        bank_id: str,
+        request_context: RequestContext = Depends(get_request_context),
+    ):
+        """List webhooks for a bank."""
+        try:
+            pool = await app.state.memory._get_pool()
+            from hindsight_api.engine.memory_engine import fq_table
+
+            rows = await pool.fetch(
+                f"""
+                SELECT id, bank_id, url, secret, event_types, enabled,
+                       http_config::text, created_at::text, updated_at::text
+                FROM {fq_table("webhooks")}
+                WHERE bank_id = $1
+                ORDER BY created_at
+                """,
+                bank_id,
+            )
+            return WebhookListResponse(
+                items=[
+                    WebhookResponse(
+                        id=str(row["id"]),
+                        bank_id=row["bank_id"],
+                        url=row["url"],
+                        secret=None,  # Never return secret in responses
+                        event_types=list(row["event_types"]) if row["event_types"] else [],
+                        enabled=row["enabled"],
+                        http_config=WebhookHttpConfig.model_validate_json(row["http_config"])
+                        if row["http_config"]
+                        else WebhookHttpConfig(),
+                        created_at=row["created_at"],
+                        updated_at=row["updated_at"],
+                    )
+                    for row in rows
+                ]
+            )
+        except (AuthenticationError, HTTPException):
+            raise
+        except Exception as e:
+            import traceback
+
+            error_detail = f"{str(e)}\n\nTraceback:\n{traceback.format_exc()}"
+            logger.error(f"Error in GET /v1/default/banks/{bank_id}/webhooks: {error_detail}")
+            raise HTTPException(status_code=500, detail=str(e))
+
+    @app.delete(
+        "/v1/default/banks/{bank_id}/webhooks/{webhook_id}",
+        response_model=DeleteResponse,
+        summary="Delete webhook",
+        description="Remove a registered webhook.",
+        operation_id="delete_webhook",
+        tags=["Webhooks"],
+    )
+    async def api_delete_webhook(
+        bank_id: str,
+        webhook_id: str,
+        request_context: RequestContext = Depends(get_request_context),
+    ):
+        """Delete a webhook."""
+        try:
+            pool = await app.state.memory._get_pool()
+            from hindsight_api.engine.memory_engine import fq_table
+
+            result = await pool.execute(
+                f"DELETE FROM {fq_table('webhooks')} WHERE id = $1 AND bank_id = $2",
+                uuid.UUID(webhook_id),
+                bank_id,
+            )
+            deleted = int(result.split()[-1]) if result else 0
+            if deleted == 0:
+                raise HTTPException(status_code=404, detail="Webhook not found")
+            return DeleteResponse(success=True)
+        except (AuthenticationError, HTTPException):
+            raise
+        except Exception as e:
+            import traceback
+
+            error_detail = f"{str(e)}\n\nTraceback:\n{traceback.format_exc()}"
+            logger.error(f"Error in DELETE /v1/default/banks/{bank_id}/webhooks/{webhook_id}: {error_detail}")
+            raise HTTPException(status_code=500, detail=str(e))
+
+    @app.patch(
+        "/v1/default/banks/{bank_id}/webhooks/{webhook_id}",
+        response_model=WebhookResponse,
+        summary="Update webhook",
+        description="Update one or more fields of a registered webhook. Only provided fields are changed.",
+        operation_id="update_webhook",
+        tags=["Webhooks"],
+    )
+    async def api_update_webhook(
+        bank_id: str,
+        webhook_id: str,
+        request: UpdateWebhookRequest,
+        request_context: RequestContext = Depends(get_request_context),
+    ):
+        """Update a webhook's fields (PATCH semantics — only sent fields are updated)."""
+        try:
+            pool = await app.state.memory._get_pool()
+            from hindsight_api.engine.memory_engine import fq_table
+
+            set_clauses: list[str] = []
+            params: list = [uuid.UUID(webhook_id), bank_id]
+
+            fields = request.model_fields_set
+            if "url" in fields:
+                params.append(request.url)
+                set_clauses.append(f"url = ${len(params)}")
+            if "secret" in fields:
+                params.append(request.secret)
+                set_clauses.append(f"secret = ${len(params)}")
+            if "event_types" in fields:
+                params.append(request.event_types)
+                set_clauses.append(f"event_types = ${len(params)}")
+            if "enabled" in fields:
+                params.append(request.enabled)
+                set_clauses.append(f"enabled = ${len(params)}")
+            if "http_config" in fields:
+                params.append(request.http_config.model_dump_json())
+                set_clauses.append(f"http_config = ${len(params)}::jsonb")
+
+            if not set_clauses:
+                raise HTTPException(status_code=422, detail="No fields provided to update")
+
+            set_clauses.append("updated_at = NOW()")
+            row = await pool.fetchrow(
+                f"""
+                UPDATE {fq_table("webhooks")}
+                SET {", ".join(set_clauses)}
+                WHERE id = $1 AND bank_id = $2
+                RETURNING id, bank_id, url, secret, event_types, enabled,
+                          http_config::text, created_at::text, updated_at::text
+                """,
+                *params,
+            )
+            if not row:
+                raise HTTPException(status_code=404, detail="Webhook not found")
+            return WebhookResponse(
+                id=str(row["id"]),
+                bank_id=row["bank_id"],
+                url=row["url"],
+                secret=None,
+                event_types=list(row["event_types"]) if row["event_types"] else [],
+                enabled=row["enabled"],
+                http_config=WebhookHttpConfig.model_validate_json(row["http_config"])
+                if row["http_config"]
+                else WebhookHttpConfig(),
+                created_at=row["created_at"],
+                updated_at=row["updated_at"],
+            )
+        except (AuthenticationError, HTTPException):
+            raise
+        except Exception as e:
+            import traceback
+
+            error_detail = f"{str(e)}\n\nTraceback:\n{traceback.format_exc()}"
+            logger.error(f"Error in PATCH /v1/default/banks/{bank_id}/webhooks/{webhook_id}: {error_detail}")
+            raise HTTPException(status_code=500, detail=str(e))
+
+    @app.get(
+        "/v1/default/banks/{bank_id}/webhooks/{webhook_id}/deliveries",
+        response_model=WebhookDeliveryListResponse,
+        summary="List webhook deliveries",
+        description="Inspect delivery history for a webhook (useful for debugging).",
+        operation_id="list_webhook_deliveries",
+        tags=["Webhooks"],
+    )
+    async def api_list_webhook_deliveries(
+        bank_id: str,
+        webhook_id: str,
+        limit: int = Query(default=50, le=200, description="Maximum number of deliveries to return"),
+        cursor: str | None = Query(default=None, description="Pagination cursor (created_at of last item)"),
+        request_context: RequestContext = Depends(get_request_context),
+    ):
+        """List deliveries for a specific webhook, newest first. Use next_cursor for pagination."""
+        try:
+            pool = await app.state.memory._get_pool()
+            from hindsight_api.engine.memory_engine import fq_table
+
+            # Verify webhook belongs to this bank
+            webhook_row = await pool.fetchrow(
+                f"SELECT id FROM {fq_table('webhooks')} WHERE id = $1 AND bank_id = $2",
+                uuid.UUID(webhook_id),
+                bank_id,
+            )
+            if not webhook_row:
+                raise HTTPException(status_code=404, detail="Webhook not found")
+
+            # Fetch limit+1 to detect if there's a next page
+            fetch_limit = limit + 1
+            if cursor:
+                rows = await pool.fetch(
+                    f"""
+                    SELECT operation_id, status, retry_count, next_retry_at::text,
+                           error_message, task_payload, result_metadata::text, created_at::text, updated_at::text
+                    FROM {fq_table("async_operations")}
+                    WHERE operation_type = 'webhook_delivery'
+                      AND bank_id = $1
+                      AND task_payload->>'webhook_id' = $2
+                      AND created_at < $3::timestamptz
+                    ORDER BY created_at DESC
+                    LIMIT $4
+                    """,
+                    bank_id,
+                    webhook_id,
+                    cursor,
+                    fetch_limit,
+                )
+            else:
+                rows = await pool.fetch(
+                    f"""
+                    SELECT operation_id, status, retry_count, next_retry_at::text,
+                           error_message, task_payload, result_metadata::text, created_at::text, updated_at::text
+                    FROM {fq_table("async_operations")}
+                    WHERE operation_type = 'webhook_delivery'
+                      AND bank_id = $1
+                      AND task_payload->>'webhook_id' = $2
+                    ORDER BY created_at DESC
+                    LIMIT $3
+                    """,
+                    bank_id,
+                    webhook_id,
+                    fetch_limit,
+                )
+
+            has_more = len(rows) > limit
+            page = rows[:limit]
+            next_cursor = page[-1]["created_at"] if has_more and page else None
+            return WebhookDeliveryListResponse(
+                items=[WebhookDeliveryResponse.from_async_operation_row(dict(row)) for row in page],
+                next_cursor=next_cursor,
+            )
+        except (AuthenticationError, HTTPException):
+            raise
+        except Exception as e:
+            import traceback
+
+            error_detail = f"{str(e)}\n\nTraceback:\n{traceback.format_exc()}"
+            logger.error(f"Error in GET /v1/default/banks/{bank_id}/webhooks/{webhook_id}/deliveries: {error_detail}")
             raise HTTPException(status_code=500, detail=str(e))
 
     @app.post(
@@ -3772,7 +4363,9 @@ def _register_routes(app: FastAPI):
             contents = []
             for item in request.items:
                 content_dict = {"content": item.content}
-                if item.timestamp:
+                if item.timestamp == "unset":
+                    content_dict["event_date"] = None
+                elif item.timestamp:
                     content_dict["event_date"] = item.timestamp
                 if item.context:
                     content_dict["context"] = item.context
@@ -3784,6 +4377,8 @@ def _register_routes(app: FastAPI):
                     content_dict["entities"] = [{"text": e.text, "type": e.type or "CONCEPT"} for e in item.entities]
                 if item.tags:
                     content_dict["tags"] = item.tags
+                if item.observation_scopes is not None:
+                    content_dict["observation_scopes"] = item.observation_scopes
                 contents.append(content_dict)
 
             if request.async_:
@@ -3824,6 +4419,12 @@ def _register_routes(app: FastAPI):
                         document_tags=request.document_tags,
                         request_context=request_context,
                         return_usage=True,
+                        outbox_callback=app.state.memory._build_retain_outbox_callback(
+                            bank_id=bank_id,
+                            contents=contents,
+                            operation_id=None,
+                            schema=_current_schema.get(),
+                        ),
                     )
 
                 return RetainResponse.model_validate(
@@ -3873,8 +4474,14 @@ def _register_routes(app: FastAPI):
         "Use the operations endpoint to monitor progress.\n\n"
         "**Request format:** multipart/form-data with:\n"
         "- `files`: One or more files to upload\n"
-        "- `request`: JSON string with FileRetainRequest model (files_metadata)\n\n"
-        "**Note:** File parser is configured server-side via `HINDSIGHT_API_FILE_PARSER` (default: markitdown).",
+        "- `request`: JSON string with FileRetainRequest model\n\n"
+        "**Parser selection:**\n"
+        "- Set `parser` in the request body to override the server default for all files.\n"
+        "- Set `parser` inside a `files_metadata` entry for per-file control.\n"
+        "- Pass a list (e.g. `['iris', 'markitdown']`) to define an ordered fallback chain — "
+        "each parser is tried in sequence until one succeeds.\n"
+        "- Falls back to the server default (`HINDSIGHT_API_FILE_PARSER`) if not specified.\n"
+        "- Only parsers enabled on the server may be requested; others return HTTP 400.",
         operation_id="file_retain",
         tags=["Files"],
     )
@@ -3920,20 +4527,39 @@ def _register_routes(app: FastAPI):
                     detail=f"files_metadata count ({len(request_data.files_metadata)}) must match files count ({len(files)})",
                 )
 
+            # Resolve the registered parser names for allowlist validation
+            registered_parsers = app.state.memory._parser_registry.list_parsers()
+            allowlist = config.file_parser_allowlist if config.file_parser_allowlist is not None else registered_parsers
+
+            def _resolve_parser(raw: str | list[str] | None) -> list[str]:
+                """Normalize parser value to a non-empty list of names."""
+                if raw is None:
+                    return config.file_parser
+                return [raw] if isinstance(raw, str) else list(raw)
+
+            def _validate_parsers(parsers: list[str], context: str) -> None:
+                """Raise HTTP 400 if any parser name is not in the allowlist."""
+                disallowed = [p for p in parsers if p not in allowlist]
+                if disallowed:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Parser(s) not available ({context}): {disallowed}. Available: {allowlist}",
+                    )
+
+            # Validate request-level parser early (before reading files)
+            if request_data.parser is not None:
+                _validate_parsers(_resolve_parser(request_data.parser), "request-level parser")
+
             # Prepare file items and calculate total batch size
+            import io
+
             file_items = []
             total_batch_size = 0
 
             for i, file in enumerate(files):
                 # Read file content to check size
                 file_content = await file.read()
-                size = len(file_content)
-                total_batch_size += size
-
-                # Create a temporary file-like object from the bytes
-                import io
-
-                file_obj = io.BytesIO(file_content)
+                total_batch_size += len(file_content)
 
                 # Create a mock UploadFile with the necessary attributes
                 class FileWrapper:
@@ -3941,7 +4567,6 @@ def _register_routes(app: FastAPI):
                         self._content = content
                         self.filename = filename
                         self.content_type = content_type
-                        self._buffer = io.BytesIO(content)
 
                     async def read(self):
                         return self._content
@@ -3952,6 +4577,12 @@ def _register_routes(app: FastAPI):
                 file_meta = request_data.files_metadata[i] if request_data.files_metadata else FileRetainMetadata()
                 doc_id = file_meta.document_id or f"file_{uuid.uuid4()}"
 
+                # Resolve and validate per-file parser chain
+                # Priority: per-file > request-level > server default
+                raw_parser = file_meta.parser if file_meta.parser is not None else request_data.parser
+                parser_chain = _resolve_parser(raw_parser)
+                _validate_parsers(parser_chain, f"file '{file.filename}'")
+
                 item = {
                     "file": wrapped_file,
                     "document_id": doc_id,
@@ -3959,6 +4590,7 @@ def _register_routes(app: FastAPI):
                     "metadata": file_meta.metadata or {},
                     "tags": file_meta.tags or [],
                     "timestamp": file_meta.timestamp,
+                    "parser": parser_chain,
                 }
                 file_items.append(item)
 
@@ -3973,7 +4605,6 @@ def _register_routes(app: FastAPI):
             result = await app.state.memory.submit_async_file_retain(
                 bank_id=bank_id,
                 file_items=file_items,
-                parser=config.file_parser,
                 document_tags=None,
                 request_context=request_context,
             )
@@ -4012,6 +4643,8 @@ def _register_routes(app: FastAPI):
             await app.state.memory.delete_bank(bank_id, fact_type=type, request_context=request_context)
 
             return DeleteResponse(success=True)
+        except OperationValidationError as e:
+            raise HTTPException(status_code=e.status_code, detail=e.reason)
         except (AuthenticationError, HTTPException):
             raise
         except Exception as e:

@@ -56,8 +56,47 @@ client.retain(
 # [/docs:document-update]
 
 
-# [docs:document-get]
+# [docs:document-list]
+from hindsight_client_api import ApiClient, Configuration
+from hindsight_client_api.api import DocumentsApi
+
+async def list_documents_example():
+    config = Configuration(host="http://localhost:8888")
+    api_client = ApiClient(config)
+    api = DocumentsApi(api_client)
+
+    # List all documents
+    result = await api.list_documents(bank_id="my-bank")
+    print(f"Total documents: {result.total}")
+
+    # Filter by document ID substring
+    result = await api.list_documents(bank_id="my-bank", q="report")
+
+    # Filter by tags — only docs tagged with "team-a" (untagged excluded)
+    result = await api.list_documents(
+        bank_id="my-bank",
+        tags=["team-a"],
+        tags_match="any_strict",
+    )
+
+    # Combine ID search and tags
+    result = await api.list_documents(
+        bank_id="my-bank",
+        q="meeting",
+        tags=["team-a", "team-b"],
+        tags_match="all_strict",  # must have both tags
+    )
+
+    # Paginate
+    result = await api.list_documents(bank_id="my-bank", limit=20, offset=40)
+    print(f"Page items: {len(result.items)}")
+
 import asyncio
+asyncio.run(list_documents_example())
+# [/docs:document-list]
+
+
+# [docs:document-get]
 from hindsight_client_api import ApiClient, Configuration
 from hindsight_client_api.api import DocumentsApi
 
@@ -79,6 +118,35 @@ async def get_document_example():
 
 asyncio.run(get_document_example())
 # [/docs:document-get]
+
+
+# [docs:document-update]
+from hindsight_client_api import ApiClient, Configuration
+from hindsight_client_api.api import DocumentsApi
+from hindsight_client_api.models import UpdateDocumentRequest
+
+async def update_document_example():
+    config = Configuration(host="http://localhost:8888")
+    api_client = ApiClient(config)
+    api = DocumentsApi(api_client)
+
+    # Fix tags on a document retained with the wrong scope
+    result = await api.update_document(
+        bank_id="my-bank",
+        document_id="meeting-2024-03-15",
+        update_document_request=UpdateDocumentRequest(tags=["team-a", "team-b"]),
+    )
+    print(f"Updated: {result.success}")
+
+    # Remove all tags (make document visible everywhere)
+    await api.update_document(
+        bank_id="my-bank",
+        document_id="meeting-2024-03-15",
+        update_document_request=UpdateDocumentRequest(tags=[]),
+    )
+
+asyncio.run(update_document_example())
+# [/docs:document-update]
 
 
 # [docs:document-delete]

@@ -124,6 +124,7 @@ def create_llm_provider(
     vertexai_project_id: str | None = None,
     vertexai_region: str | None = None,
     vertexai_credentials: Any = None,
+    gemini_safety_settings: list | None = None,
 ) -> Any:  # Returns LLMInterface
     """
     Factory function to create the appropriate LLM provider implementation.
@@ -192,6 +193,7 @@ def create_llm_provider(
             vertexai_project_id=vertexai_project_id,
             vertexai_region=vertexai_region,
             vertexai_credentials=vertexai_credentials,
+            gemini_safety_settings=gemini_safety_settings,
         )
 
     elif provider_lower == "anthropic":
@@ -234,6 +236,7 @@ class LLMProvider:
         reasoning_effort: str = "low",
         groq_service_tier: str | None = None,
         openai_service_tier: str | None = None,
+        gemini_safety_settings: list | None = None,
     ):
         """
         Initialize LLM provider.
@@ -246,6 +249,7 @@ class LLMProvider:
             reasoning_effort: Reasoning effort level for supported providers.
             groq_service_tier: Groq service tier ("on_demand", "flex", "auto") - from config.
             openai_service_tier: OpenAI service tier (None or "flex") - from config.
+            gemini_safety_settings: Safety settings for Gemini/VertexAI providers.
         """
         self.provider = provider.lower()
         self.api_key = api_key
@@ -255,6 +259,8 @@ class LLMProvider:
         # Service tiers from hierarchical config (not env vars)
         self.groq_service_tier = groq_service_tier
         self.openai_service_tier = openai_service_tier
+        # Gemini safety settings (instance default; can be overridden per-request via context var)
+        self.gemini_safety_settings = gemini_safety_settings
 
         # Validate provider
         valid_providers = [
@@ -323,6 +329,18 @@ class LLMProvider:
                 f"model={self.model}, auth={'service_account' if service_account_key else 'ADC'}"
             )
 
+        # For Gemini/VertexAI providers: read safety settings from global config if not explicitly provided
+        # Use _get_raw_config() to bypass StaticConfigProxy (which blocks configurable fields),
+        # since LLMProvider initialization legitimately needs the server-level default.
+        if self.provider in ("gemini", "vertexai") and self.gemini_safety_settings is None:
+            from ..config import _get_raw_config
+
+            try:
+                raw_config = _get_raw_config()
+                self.gemini_safety_settings = raw_config.llm_gemini_safety_settings
+            except Exception:
+                pass  # Config may not be initialized in test environments
+
         # Create provider implementation using factory
         self._provider_impl = create_llm_provider(
             provider=self.provider,
@@ -335,6 +353,7 @@ class LLMProvider:
             vertexai_project_id=vertexai_project_id,
             vertexai_region=vertexai_region,
             vertexai_credentials=vertexai_credentials,
+            gemini_safety_settings=self.gemini_safety_settings,
         )
 
         # Backward compatibility: Keep mock provider properties
@@ -503,6 +522,14 @@ class LLMProvider:
 
             return result
 
+    def set_response_callback(self, fn: Any) -> None:
+        """Set a callback invoked on each call() instead of the fixed mock response."""
+        if self.provider == "mock":
+            from .providers.mock_llm import MockLLM
+
+            if isinstance(self._provider_impl, MockLLM):
+                self._provider_impl.set_response_callback(fn)
+
     def set_mock_response(self, response: Any) -> None:
         """Set the response to return from mock calls."""
         # Backward compatibility: Store in both wrapper and provider implementation
@@ -595,6 +622,23 @@ class LLMProvider:
         # SDK will automatically check for authentication when first used
         # No need to verify here - let it fail gracefully on first call with helpful error
 
+    def with_config(self, config: Any) -> "ConfiguredLLMProvider":
+        """
+        Return a configured wrapper for a specific bank operation.
+
+        The wrapper applies per-bank overrides (e.g. Gemini safety settings)
+        to every ``call()`` / ``call_with_tools()`` invocation without
+        changing the underlying provider or its long-lived client connection.
+
+        Args:
+            config: Resolved ``HindsightConfig`` for the current bank/request.
+
+        Returns:
+            A ``ConfiguredLLMProvider`` that delegates to this provider with
+            the supplied config applied.
+        """
+        return ConfiguredLLMProvider(self, config.llm_gemini_safety_settings)
+
     async def cleanup(self) -> None:
         """Clean up resources."""
         pass
@@ -654,6 +698,59 @@ class LLMProvider:
         model = os.getenv("HINDSIGHT_API_JUDGE_LLM_MODEL", os.getenv("HINDSIGHT_API_LLM_MODEL", "openai/gpt-oss-120b"))
 
         return cls(provider=provider, api_key=api_key, base_url=base_url, model=model, reasoning_effort="high")
+
+
+class ConfiguredLLMProvider:
+    """
+    Thin wrapper around LLMProvider that applies bank-specific config to every call.
+
+    Obtained via ``LLMProvider.with_config(resolved_config)``.  The wrapper
+    sets any provider-specific overrides (currently Gemini safety settings)
+    immediately before each call using a ContextVar token, then resets it
+    afterwards — so nesting is safe and the configuration cannot leak across
+    operations.
+
+    All attribute access falls through to the underlying provider so callers
+    that read ``llm.provider``, ``llm.model``, etc. continue to work without
+    any changes.
+    """
+
+    def __init__(self, provider: "LLMProvider", gemini_safety_settings: list | None) -> None:
+        # Use object.__setattr__ to avoid triggering __getattr__
+        object.__setattr__(self, "_provider", provider)
+        object.__setattr__(self, "_gemini_safety_settings", gemini_safety_settings)
+
+    # ── attribute passthrough ──────────────────────────────────────────────────
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(object.__getattribute__(self, "_provider"), name)
+
+    # ── overridden call methods ────────────────────────────────────────────────
+
+    async def call(self, messages: list[dict[str, Any]], **kwargs: Any) -> Any:
+        from .providers.gemini_llm import _safety_settings_ctx
+
+        token = _safety_settings_ctx.set(object.__getattribute__(self, "_gemini_safety_settings"))
+        try:
+            return await object.__getattribute__(self, "_provider").call(messages=messages, **kwargs)
+        finally:
+            _safety_settings_ctx.reset(token)
+
+    async def call_with_tools(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        **kwargs: Any,
+    ) -> "LLMToolCallResult":
+        from .providers.gemini_llm import _safety_settings_ctx
+
+        token = _safety_settings_ctx.set(object.__getattribute__(self, "_gemini_safety_settings"))
+        try:
+            return await object.__getattribute__(self, "_provider").call_with_tools(
+                messages=messages, tools=tools, **kwargs
+            )
+        finally:
+            _safety_settings_ctx.reset(token)
 
 
 # Backwards compatibility alias

@@ -166,7 +166,6 @@ def create_mcp_server(memory: MemoryEngine, multi_bank: bool = True) -> FastMCP:
         api_key_id_resolver=get_current_api_key_id,  # Propagate api_key_id for usage metering
         include_bank_id_param=multi_bank,
         tools=base_tools,
-        retain_fire_and_forget=False,  # HTTP MCP supports sync/async modes
     )
 
     register_mcp_tools(mcp, memory, config)
@@ -332,7 +331,7 @@ class MCPMiddleware:
                 auth_tenant_id = auth_context.tenant_id
                 auth_api_key_id = auth_context.api_key_id
             except AuthenticationError as e:
-                await self._send_error(send, 401, str(e))
+                await self._send_error(send, 401, str(e), extra_headers=e.headers)
                 return
 
         # Set schema from tenant context so downstream DB queries use the correct schema
@@ -414,14 +413,17 @@ class MCPMiddleware:
             if schema_token is not None:
                 _current_schema.reset(schema_token)
 
-    async def _send_error(self, send, status: int, message: str):
+    async def _send_error(self, send, status: int, message: str, extra_headers: dict[str, str] | None = None):
         """Send an error response."""
         body = json.dumps({"error": message}).encode()
+        headers = [(b"content-type", b"application/json")]
+        for key, value in (extra_headers or {}).items():
+            headers.append((key.encode(), value.encode()))
         await send(
             {
                 "type": "http.response.start",
                 "status": status,
-                "headers": [(b"content-type", b"application/json")],
+                "headers": headers,
             }
         )
         await send(

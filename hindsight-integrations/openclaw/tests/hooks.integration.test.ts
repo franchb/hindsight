@@ -2,7 +2,7 @@
  * Integration tests for the OpenClaw plugin hooks.
  *
  * Loads the plugin with a mock MoltbotPluginAPI in HTTP mode, then triggers
- * `before_agent_start` and `agent_end` hooks with realistic event payloads.
+ * `before_prompt_build` and `agent_end` hooks with realistic event payloads.
  * Client methods (recall / retain) are spied on to verify the plugin
  * orchestrates them correctly without requiring a full LLM pipeline.
  *
@@ -134,12 +134,17 @@ beforeAll(async () => {
   process.env.HINDSIGHT_EMBED_API_URL = HINDSIGHT_API_URL;
 
   const mod = await import('../src/index.js');
+  const { HindsightClient } = await import('../src/client.js');
   const pluginFn = mod.default;
   const getClient = mod.getClient;
 
   const handle = createMockApi({
     dynamicBankId: true,
     excludeProviders: ['slack'],
+    retainEveryNTurns: 1, // retain every turn so individual tests aren't affected by chunking
+    recallContextTurns: 3,
+    recallMaxQueryChars: 180,
+    recallRoles: ['user'],
     // No bankMission — keeps init lean
   });
   triggerHook = handle.trigger;
@@ -152,11 +157,11 @@ beforeAll(async () => {
   await handle.startServices();
 
   // After startServices the client must be ready.
-  const c = getClient();
-  if (!c) throw new Error('[Hooks Integration] Client not initialized after service start');
+  if (!getClient()) throw new Error('[Hooks Integration] Client not initialized after service start');
 
-  recallSpy = vi.spyOn(c, 'recall') as ReturnType<typeof vi.spyOn<HindsightClient, 'recall'>>;
-  retainSpy = vi.spyOn(c, 'retain') as ReturnType<typeof vi.spyOn<HindsightClient, 'retain'>>;
+  // Spy on the prototype so all per-bank instances created by getClientForContext are intercepted.
+  recallSpy = vi.spyOn(HindsightClient.prototype, 'recall') as ReturnType<typeof vi.spyOn<HindsightClient, 'recall'>>;
+  retainSpy = vi.spyOn(HindsightClient.prototype, 'retain') as ReturnType<typeof vi.spyOn<HindsightClient, 'retain'>>;
 }, 30_000);
 
 afterAll(async () => {
@@ -177,13 +182,13 @@ afterEach(() => {
 // before_agent_start
 // ---------------------------------------------------------------------------
 
-describe('before_agent_start hook', () => {
+describe('before_prompt_build hook', () => {
   it('skips recall for excluded providers and returns undefined', async () => {
     if (!apiReachable) return;
 
     const result = await triggerHook(
-      'before_agent_start',
-      { rawMessage: 'What are my preferences?', prompt: 'What are my preferences?' },
+      'before_prompt_build',
+      { rawMessage: 'What are my preferences?', prompt: 'What are my preferences?', messages: [] },
       { messageProvider: 'slack', senderId: 'U001' },
     );
 
@@ -195,8 +200,8 @@ describe('before_agent_start hook', () => {
     if (!apiReachable) return;
 
     const result = await triggerHook(
-      'before_agent_start',
-      { rawMessage: 'Hi', prompt: 'Hi' },
+      'before_prompt_build',
+      { rawMessage: 'Hi', prompt: 'Hi', messages: [] },
       { messageProvider: 'telegram', senderId: 'U001' },
     );
 
@@ -209,8 +214,8 @@ describe('before_agent_start hook', () => {
     recallSpy.mockResolvedValue(EMPTY_RECALL);
 
     const result = await triggerHook(
-      'before_agent_start',
-      { rawMessage: 'What programming language do I like?', prompt: '' },
+      'before_prompt_build',
+      { rawMessage: 'What programming language do I like?', prompt: '', messages: [] },
       { messageProvider: 'telegram', senderId: 'U002' },
     );
 
@@ -228,8 +233,8 @@ describe('before_agent_start hook', () => {
     });
 
     const result = (await triggerHook(
-      'before_agent_start',
-      { rawMessage: 'What programming language do I prefer?', prompt: '' },
+      'before_prompt_build',
+      { rawMessage: 'What programming language do I prefer?', prompt: '', messages: [] },
       { messageProvider: 'telegram', senderId: 'U003' },
     )) as { prependContext: string };
 
@@ -239,7 +244,7 @@ describe('before_agent_start hook', () => {
     expect(result.prependContext).toContain('</hindsight_memories>');
   });
 
-  it('injects all memory result fields in the prependContext JSON', async () => {
+  it('injects all memory result fields in the prependContext', async () => {
     if (!apiReachable) return;
     const mem = makeMemoryResult('User prefers dark mode');
     mem.tags = ['preference'];
@@ -252,22 +257,15 @@ describe('before_agent_start hook', () => {
     });
 
     const result = (await triggerHook(
-      'before_agent_start',
-      { rawMessage: 'Do I prefer dark or light mode?', prompt: '' },
+      'before_prompt_build',
+      { rawMessage: 'Do I prefer dark or light mode?', prompt: '', messages: [] },
       { messageProvider: 'telegram', senderId: 'U004' },
     )) as { prependContext: string };
 
-    // The prependContext should be valid JSON containing all MemoryResult fields
-    const jsonStart = result.prependContext.indexOf('[');
-    const jsonEnd = result.prependContext.lastIndexOf(']') + 1;
-    const parsed = JSON.parse(result.prependContext.slice(jsonStart, jsonEnd)) as unknown[];
-    expect(parsed).toHaveLength(1);
-    const first = parsed[0] as Record<string, unknown>;
-    expect(first.id).toBe(mem.id);
-    expect(first.text).toBe('User prefers dark mode');
-    expect(first.type).toBe('fact');
-    expect(first.tags).toEqual(['preference']);
-    expect(first.entities).toEqual(['dark_mode']);
+    // formatMemories returns a bullet list, not JSON
+    expect(result.prependContext).toContain('- User prefers dark mode');
+    expect(result.prependContext).toContain('<hindsight_memories>');
+    expect(result.prependContext).toContain('</hindsight_memories>');
   });
 
   it('extracts the inner query from an envelope-formatted prompt when rawMessage is absent', async () => {
@@ -276,8 +274,8 @@ describe('before_agent_start hook', () => {
 
     const envelopePrompt = '[Telegram Chat]\nWhat is my favorite food?\n[from: Alice]';
     await triggerHook(
-      'before_agent_start',
-      { rawMessage: '', prompt: envelopePrompt },
+      'before_prompt_build',
+      { rawMessage: '', prompt: envelopePrompt, messages: [] },
       { messageProvider: 'telegram', senderId: 'U005' },
     );
 
@@ -289,13 +287,39 @@ describe('before_agent_start hook', () => {
     expect(callArgs.query).toContain('What is my favorite food?');
   });
 
+  it('passes a latest-priority contextual recall query and respects max query chars', async () => {
+    if (!apiReachable) return;
+    recallSpy.mockResolvedValue(EMPTY_RECALL);
+
+    await triggerHook(
+      'before_prompt_build',
+      {
+        rawMessage: 'Do I still prefer dark mode?',
+        prompt: '',
+        messages: [
+          { role: 'user', content: 'I prefer dark mode in IDEs.' },
+          { role: 'assistant', content: 'Noted: dark mode preference.' },
+          { role: 'user', content: 'Do I still prefer dark mode?' },
+        ],
+      },
+      { messageProvider: 'telegram', senderId: 'U006A' },
+    );
+
+    expect(recallSpy).toHaveBeenCalledOnce();
+    const [callArgs] = recallSpy.mock.calls[0];
+    expect(callArgs.query).toContain('Do I still prefer dark mode?');
+    expect(callArgs.query).toContain('user: I prefer dark mode in IDEs.');
+    expect(callArgs.query).not.toContain('assistant: Noted: dark mode preference.');
+    expect(callArgs.query.length).toBeLessThanOrEqual(180);
+  });
+
   it('passes max_tokens to recall', async () => {
     if (!apiReachable) return;
     recallSpy.mockResolvedValue(EMPTY_RECALL);
 
     await triggerHook(
-      'before_agent_start',
-      { rawMessage: 'Tell me about my hobbies please.', prompt: '' },
+      'before_prompt_build',
+      { rawMessage: 'Tell me about my hobbies please.', prompt: '', messages: [] },
       { messageProvider: 'telegram', senderId: 'U006' },
     );
 
@@ -304,7 +328,7 @@ describe('before_agent_start hook', () => {
     expect(callArgs.max_tokens).toBeGreaterThan(0);
   });
 
-  it('includes the user message in the prependContext block', async () => {
+  it('includes recalled memories in the prependContext block', async () => {
     if (!apiReachable) return;
     recallSpy.mockResolvedValue({
       results: [makeMemoryResult('User loves hiking')],
@@ -314,12 +338,13 @@ describe('before_agent_start hook', () => {
     });
 
     const result = (await triggerHook(
-      'before_agent_start',
-      { rawMessage: 'What outdoor activities do I enjoy?', prompt: '' },
+      'before_prompt_build',
+      { rawMessage: 'What outdoor activities do I enjoy?', prompt: '', messages: [] },
       { messageProvider: 'telegram', senderId: 'U007' },
     )) as { prependContext: string };
 
-    expect(result.prependContext).toContain('What outdoor activities do I enjoy?');
+    expect(result.prependContext).toContain('User loves hiking');
+    expect(result.prependContext).toContain('<hindsight_memories>');
   });
 });
 
@@ -533,10 +558,11 @@ describe('agent_end hook', () => {
     expect(retainSpy).toHaveBeenCalledOnce();
     const [req] = retainSpy.mock.calls[0];
 
-    // Each message should appear in the correct envelope format
-    expect(req.content).toContain('[role: user]\nMy name is Carol.\n[user:end]');
-    expect(req.content).toContain('[role: assistant]\nNice to meet you, Carol!\n[assistant:end]');
+    // Only the last turn (from last user message onwards) is retained
     expect(req.content).toContain('[role: user]\nI work as a data scientist.\n[user:end]');
-    expect(req.metadata?.message_count).toBe('4');
+    expect(req.content).toContain("[role: assistant]\nThat's a fascinating career!\n[assistant:end]");
+    // Earlier turns are excluded by turn boundary detection
+    expect(req.content).not.toContain('My name is Carol.');
+    expect(req.metadata?.message_count).toBe('2');
   });
 });

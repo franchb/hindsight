@@ -44,9 +44,48 @@ await client.retain('my-bank', 'Project deadline: April 15 (extended)', {
 // [/docs:document-update]
 
 
-// [docs:document-get]
+// [docs:document-list]
 const apiClient = createClient(createConfig({ baseUrl: 'http://localhost:8888' }));
 
+// List all documents
+const { data: allDocs } = await sdk.listDocuments({
+    client: apiClient,
+    path: { bank_id: 'my-bank' }
+});
+console.log(`Total documents: ${allDocs.total}`);
+
+// Filter by document ID substring
+const { data: reportDocs } = await sdk.listDocuments({
+    client: apiClient,
+    path: { bank_id: 'my-bank' },
+    query: { q: 'report' }
+});
+
+// Filter by tags — only docs tagged with "team-a" (untagged excluded)
+const { data: taggedDocs } = await sdk.listDocuments({
+    client: apiClient,
+    path: { bank_id: 'my-bank' },
+    query: { tags: ['team-a'], tags_match: 'any_strict' }
+});
+
+// Combine ID search and tags
+const { data: filtered } = await sdk.listDocuments({
+    client: apiClient,
+    path: { bank_id: 'my-bank' },
+    query: { q: 'meeting', tags: ['team-a', 'team-b'], tags_match: 'all_strict' }
+});
+
+// Paginate
+const { data: page } = await sdk.listDocuments({
+    client: apiClient,
+    path: { bank_id: 'my-bank' },
+    query: { limit: 20, offset: 40 }
+});
+console.log(`Page items: ${page.items.length}`);
+// [/docs:document-list]
+
+
+// [docs:document-get]
 // Get document to expand context from recall results
 const { data: doc, error } = await sdk.getDocument({
     client: apiClient,
@@ -62,6 +101,29 @@ console.log(`Original text: ${doc.original_text}`);
 console.log(`Memory count: ${doc.memory_unit_count}`);
 console.log(`Created: ${doc.created_at}`);
 // [/docs:document-get]
+
+
+// [docs:document-update]
+// Fix tags on a document retained with the wrong scope
+const { data: updateResult, error: updateError } = await sdk.updateDocument({
+    client: apiClient,
+    path: { bank_id: 'my-bank', document_id: 'meeting-2024-03-15-section-1' },
+    body: { tags: ['team-a', 'team-b'] }
+});
+
+if (updateError) {
+    throw new Error(`Failed to update tags: ${JSON.stringify(updateError)}`);
+}
+
+console.log(`Updated: ${updateResult.success}`);
+
+// Remove all tags (make document visible everywhere)
+await sdk.updateDocument({
+    client: apiClient,
+    path: { bank_id: 'my-bank', document_id: 'meeting-2024-03-15-section-1' },
+    body: { tags: [] }
+});
+// [/docs:document-update]
 
 
 // [docs:document-delete]

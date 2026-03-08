@@ -5,11 +5,17 @@ Note: Consolidation runs automatically after retain via SyncTaskBackend in tests
 """
 
 import uuid
-from unittest.mock import patch
+from datetime import datetime, timezone
+from unittest.mock import AsyncMock, call, patch
 
 import pytest
 
-from hindsight_api.engine.consolidation.consolidator import run_consolidation_job
+from hindsight_api.config import _get_raw_config
+from hindsight_api.engine.consolidation.consolidator import (
+    _aggregate_source_fields,
+    _find_related_observations,
+    run_consolidation_job,
+)
 from hindsight_api.engine.memory_engine import MemoryEngine
 from hindsight_api.engine.reflect.tools import (
     tool_recall,
@@ -2084,3 +2090,411 @@ async def test_consolidation_with_observations_mission(memory: "MemoryEngine", r
         else:
             os.environ["HINDSIGHT_API_OBSERVATIONS_MISSION"] = original
         clear_config_cache()
+
+
+
+@pytest.mark.asyncio
+async def test_observation_scopes_explicit_multi_pass(memory: MemoryEngine, request_context):
+    """Test that observation_scopes with an explicit list triggers separate consolidation passes.
+
+    A single memory stored with observation_scopes=[["user:alice"], ["teacher:ben"]]
+    must produce:
+      - At least one observation with tags containing ONLY "user:alice" (not "teacher:ben")
+      - At least one observation with tags containing ONLY "teacher:ben" (not "user:alice")
+
+    The two tag scopes must remain isolated — no observation should carry both tags,
+    which would indicate the scopes were incorrectly merged.
+    """
+    bank_id = f"test-obs-scopes-explicit-{uuid.uuid4().hex[:8]}"
+
+    await memory.get_bank_profile(bank_id=bank_id, request_context=request_context)
+
+    # Retain a memory with two explicit observation scopes
+    await memory.retain_batch_async(
+        bank_id=bank_id,
+        contents=[
+            {
+                "content": "Alice, a student, worked hard in the lesson with teacher Ben.",
+                "observation_scopes": [["user:alice"], ["teacher:ben"]],
+            }
+        ],
+        request_context=request_context,
+    )
+
+    async with memory._pool.acquire() as conn:
+        observations = await conn.fetch(
+            """
+            SELECT id, text, tags
+            FROM memory_units
+            WHERE bank_id = $1 AND fact_type = 'observation'
+            ORDER BY created_at
+            """,
+            bank_id,
+        )
+
+    try:
+        # Must have at least 2 observations (one per tag scope)
+        assert len(observations) >= 2, (
+            f"Expected at least 2 observations (one per tag scope), got {len(observations)}: "
+            + str([dict(o) for o in observations])
+        )
+
+        tag_sets = [set(obs["tags"] or []) for obs in observations]
+
+        # There must be at least one observation scoped to user:alice only
+        alice_only = [ts for ts in tag_sets if "user:alice" in ts and "teacher:ben" not in ts]
+        assert alice_only, (
+            f"Expected an observation scoped to 'user:alice' only, got tag sets: {tag_sets}"
+        )
+
+        # There must be at least one observation scoped to teacher:ben only
+        ben_only = [ts for ts in tag_sets if "teacher:ben" in ts and "user:alice" not in ts]
+        assert ben_only, (
+            f"Expected an observation scoped to 'teacher:ben' only, got tag sets: {tag_sets}"
+        )
+
+        # No observation should carry both tags (scopes must not be merged)
+        both = [ts for ts in tag_sets if "user:alice" in ts and "teacher:ben" in ts]
+        assert not both, (
+            f"Found observation(s) with both tags — scopes were incorrectly merged: {both}"
+        )
+    finally:
+        await memory.delete_bank(bank_id, request_context=request_context)
+
+
+@pytest.mark.asyncio
+async def test_observation_scopes_per_tag(memory: MemoryEngine, request_context):
+    """Test that observation_scopes='per_tag' derives one pass per individual tag.
+
+    A memory with tags=["user:alice", "teacher:ben"] and observation_scopes="per_tag"
+    must produce isolated observations — one scoped to "user:alice" and one to "teacher:ben".
+    """
+    bank_id = f"test-obs-scopes-pertag-{uuid.uuid4().hex[:8]}"
+
+    await memory.get_bank_profile(bank_id=bank_id, request_context=request_context)
+
+    await memory.retain_batch_async(
+        bank_id=bank_id,
+        contents=[
+            {
+                "content": "Alice, a student, worked hard in the lesson with teacher Ben.",
+                "tags": ["user:alice", "teacher:ben"],
+                "observation_scopes": "per_tag",
+            }
+        ],
+        request_context=request_context,
+    )
+
+    async with memory._pool.acquire() as conn:
+        observations = await conn.fetch(
+            """
+            SELECT id, text, tags
+            FROM memory_units
+            WHERE bank_id = $1 AND fact_type = 'observation'
+            ORDER BY created_at
+            """,
+            bank_id,
+        )
+
+    try:
+        assert len(observations) >= 2, (
+            f"Expected at least 2 observations (one per tag), got {len(observations)}: "
+            + str([dict(o) for o in observations])
+        )
+
+        tag_sets = [set(obs["tags"] or []) for obs in observations]
+
+        alice_only = [ts for ts in tag_sets if "user:alice" in ts and "teacher:ben" not in ts]
+        assert alice_only, f"Expected an observation scoped to 'user:alice' only, got: {tag_sets}"
+
+        ben_only = [ts for ts in tag_sets if "teacher:ben" in ts and "user:alice" not in ts]
+        assert ben_only, f"Expected an observation scoped to 'teacher:ben' only, got: {tag_sets}"
+    finally:
+        await memory.delete_bank(bank_id, request_context=request_context)
+
+
+@pytest.mark.asyncio
+async def test_observation_scopes_combined(memory: MemoryEngine, request_context):
+    """Test that observation_scopes='combined' produces a single observation with all tags.
+
+    A memory with tags=["user:alice", "teacher:ben"] and observation_scopes="combined"
+    must produce at least one observation that carries both tags together, and no
+    observation scoped to only one of them.
+    """
+    bank_id = f"test-obs-scopes-combined-{uuid.uuid4().hex[:8]}"
+
+    await memory.get_bank_profile(bank_id=bank_id, request_context=request_context)
+
+    await memory.retain_batch_async(
+        bank_id=bank_id,
+        contents=[
+            {
+                "content": "Alice, a student, worked hard in the lesson with teacher Ben.",
+                "tags": ["user:alice", "teacher:ben"],
+                "observation_scopes": "combined",
+            }
+        ],
+        request_context=request_context,
+    )
+
+    async with memory._pool.acquire() as conn:
+        observations = await conn.fetch(
+            """
+            SELECT id, text, tags
+            FROM memory_units
+            WHERE bank_id = $1 AND fact_type = 'observation'
+            ORDER BY created_at
+            """,
+            bank_id,
+        )
+
+    try:
+        assert len(observations) >= 1, (
+            "Expected at least 1 observation, got 0"
+        )
+
+        tag_sets = [set(obs["tags"] or []) for obs in observations]
+
+        # All observations must carry both tags (combined scope)
+        combined = [ts for ts in tag_sets if "user:alice" in ts and "teacher:ben" in ts]
+        assert combined, f"Expected at least one observation with both tags, got: {tag_sets}"
+
+        # No observation should be scoped to only one tag
+        alice_only = [ts for ts in tag_sets if "user:alice" in ts and "teacher:ben" not in ts]
+        assert not alice_only, f"Expected no alice-only observation in combined mode, got: {tag_sets}"
+
+        ben_only = [ts for ts in tag_sets if "teacher:ben" in ts and "user:alice" not in ts]
+        assert not ben_only, f"Expected no ben-only observation in combined mode, got: {tag_sets}"
+    finally:
+        await memory.delete_bank(bank_id, request_context=request_context)
+
+
+@pytest.mark.asyncio
+async def test_observation_scopes_all_combinations(memory: MemoryEngine, request_context):
+    """Test that observation_scopes='all_combinations' generates passes for every tag subset.
+
+    A memory with tags=["user:alice", "teacher:ben"] and observation_scopes="all_combinations"
+    must produce observations covering all subsets: ["user:alice"], ["teacher:ben"], and
+    ["user:alice", "teacher:ben"].
+    """
+    bank_id = f"test-obs-scopes-allcombos-{uuid.uuid4().hex[:8]}"
+
+    await memory.get_bank_profile(bank_id=bank_id, request_context=request_context)
+
+    await memory.retain_batch_async(
+        bank_id=bank_id,
+        contents=[
+            {
+                "content": "Alice, a student, worked hard in the lesson with teacher Ben.",
+                "tags": ["user:alice", "teacher:ben"],
+                "observation_scopes": "all_combinations",
+            }
+        ],
+        request_context=request_context,
+    )
+
+    async with memory._pool.acquire() as conn:
+        observations = await conn.fetch(
+            """
+            SELECT id, text, tags
+            FROM memory_units
+            WHERE bank_id = $1 AND fact_type = 'observation'
+            ORDER BY created_at
+            """,
+            bank_id,
+        )
+
+    try:
+        # With 2 tags there are 3 subsets: {alice}, {ben}, {alice, ben}
+        assert len(observations) >= 3, (
+            f"Expected at least 3 observations (one per subset), got {len(observations)}: "
+            + str([dict(o) for o in observations])
+        )
+
+        tag_sets = [set(obs["tags"] or []) for obs in observations]
+
+        alice_only = [ts for ts in tag_sets if "user:alice" in ts and "teacher:ben" not in ts]
+        assert alice_only, f"Expected an observation scoped to 'user:alice' only, got: {tag_sets}"
+
+        ben_only = [ts for ts in tag_sets if "teacher:ben" in ts and "user:alice" not in ts]
+        assert ben_only, f"Expected an observation scoped to 'teacher:ben' only, got: {tag_sets}"
+
+        combined = [ts for ts in tag_sets if "user:alice" in ts and "teacher:ben" in ts]
+        assert combined, f"Expected an observation scoped to both tags, got: {tag_sets}"
+    finally:
+        await memory.delete_bank(bank_id, request_context=request_context)
+
+
+def _dt(year: int, month: int, day: int) -> datetime:
+    return datetime(year, month, day, tzinfo=timezone.utc)
+
+
+class TestAggregateSourceFields:
+    """Unit tests for _aggregate_source_fields – no database required."""
+
+    def test_all_none_temporal_fields_stay_none(self):
+        """When source memories carry no temporal data, all fields must remain None."""
+        source_mems = [
+            {"tags": ["t1"], "event_date": None, "occurred_start": None, "occurred_end": None, "mentioned_at": None},
+            {"tags": ["t1"], "event_date": None, "occurred_start": None, "occurred_end": None, "mentioned_at": None},
+        ]
+        agg = _aggregate_source_fields(source_mems)
+        assert agg.event_date is None
+        assert agg.occurred_start is None
+        assert agg.occurred_end is None
+        assert agg.mentioned_at is None
+
+    def test_temporal_fields_aggregated_correctly(self):
+        """occurred_start and event_date are minimised; occurred_end and mentioned_at are maximised."""
+        early = _dt(2023, 1, 1)
+        late = _dt(2024, 6, 15)
+        source_mems = [
+            {
+                "tags": [],
+                "event_date": late,
+                "occurred_start": late,
+                "occurred_end": early,
+                "mentioned_at": early,
+            },
+            {
+                "tags": [],
+                "event_date": early,
+                "occurred_start": early,
+                "occurred_end": late,
+                "mentioned_at": late,
+            },
+        ]
+        agg = _aggregate_source_fields(source_mems)
+        assert agg.event_date == early
+        assert agg.occurred_start == early
+        assert agg.occurred_end == late
+        assert agg.mentioned_at == late
+
+    def test_partial_temporal_fields_ignored_when_none(self):
+        """None values in individual sources do not corrupt the min/max from sources that do have dates."""
+        d = _dt(2023, 3, 10)
+        source_mems = [
+            {"tags": [], "event_date": None, "occurred_start": None, "occurred_end": None, "mentioned_at": None},
+            {"tags": [], "event_date": d, "occurred_start": d, "occurred_end": d, "mentioned_at": d},
+        ]
+        agg = _aggregate_source_fields(source_mems)
+        assert agg.event_date == d
+        assert agg.occurred_start == d
+        assert agg.occurred_end == d
+        assert agg.mentioned_at == d
+
+    def test_tags_inherited_from_first_source_memory(self):
+        """Tags default to those of the first source memory (batch invariant)."""
+        source_mems = [
+            {"tags": ["user:alice"], "event_date": None, "occurred_start": None, "occurred_end": None, "mentioned_at": None},
+            {"tags": ["user:alice"], "event_date": None, "occurred_start": None, "occurred_end": None, "mentioned_at": None},
+        ]
+        agg = _aggregate_source_fields(source_mems)
+        assert agg.tags == ["user:alice"]
+
+    def test_tags_override_takes_precedence(self):
+        """Explicit tags parameter overrides the source-memory tags."""
+        source_mems = [
+            {"tags": ["user:alice"], "event_date": None, "occurred_start": None, "occurred_end": None, "mentioned_at": None},
+        ]
+        agg = _aggregate_source_fields(source_mems, tags=["scope:override"])
+        assert agg.tags == ["scope:override"]
+
+    def test_empty_tags_override_is_respected(self):
+        """An explicit empty list override must not fall back to source tags."""
+        source_mems = [
+            {"tags": ["user:alice"], "event_date": None, "occurred_start": None, "occurred_end": None, "mentioned_at": None},
+        ]
+        agg = _aggregate_source_fields(source_mems, tags=[])
+        assert agg.tags == []
+
+    def test_single_source_memory(self):
+        """Single-source aggregation should just pass through that memory's fields."""
+        d = _dt(2024, 11, 5)
+        source_mems = [
+            {"tags": ["x"], "event_date": d, "occurred_start": d, "occurred_end": d, "mentioned_at": d},
+        ]
+        agg = _aggregate_source_fields(source_mems)
+        assert agg.event_date == d
+        assert agg.occurred_start == d
+        assert agg.occurred_end == d
+        assert agg.mentioned_at == d
+        assert agg.tags == ["x"]
+
+
+class TestConsolidationSourceFactsConfig:
+    """Tests that consolidation uses the source_facts token config when calling recall."""
+
+    @pytest.fixture(autouse=True)
+    def enable_observations(self):
+        config = _get_raw_config()
+        original = config.enable_observations
+        config.enable_observations = True
+        yield
+        config.enable_observations = original
+
+    @pytest.mark.asyncio
+    async def test_consolidation_passes_source_facts_max_tokens_to_recall(
+        self, memory: MemoryEngine, request_context
+    ):
+        """consolidation_source_facts_max_tokens from config is forwarded to recall_async."""
+        bank_id = f"test-sf-config-total-{uuid.uuid4().hex[:8]}"
+        await memory.get_bank_profile(bank_id=bank_id, request_context=request_context)
+
+        raw = _get_raw_config()
+        fake_config = type(raw)(**{
+            **{f: getattr(raw, f) for f in raw.__dataclass_fields__},
+            "consolidation_source_facts_max_tokens": 999,
+            "consolidation_source_facts_max_tokens_per_observation": -1,
+        })
+
+        try:
+            with (
+                patch.object(memory._config_resolver, "resolve_full_config", return_value=fake_config),
+                patch.object(memory, "recall_async", wraps=memory.recall_async) as mock_recall,
+            ):
+                await _find_related_observations(
+                    memory_engine=memory,
+                    bank_id=bank_id,
+                    query="test query",
+                    request_context=request_context,
+                )
+                assert mock_recall.called
+                _, kwargs = mock_recall.call_args
+                assert kwargs.get("max_source_facts_tokens") == 999
+                assert kwargs.get("max_source_facts_tokens_per_observation") == -1
+        finally:
+            await memory.delete_bank(bank_id, request_context=request_context)
+
+    @pytest.mark.asyncio
+    async def test_consolidation_passes_source_facts_per_obs_tokens_to_recall(
+        self, memory: MemoryEngine, request_context
+    ):
+        """consolidation_source_facts_max_tokens_per_observation from config is forwarded to recall_async."""
+        bank_id = f"test-sf-config-per-obs-{uuid.uuid4().hex[:8]}"
+        await memory.get_bank_profile(bank_id=bank_id, request_context=request_context)
+
+        raw = _get_raw_config()
+        fake_config = type(raw)(**{
+            **{f: getattr(raw, f) for f in raw.__dataclass_fields__},
+            "consolidation_source_facts_max_tokens": -1,
+            "consolidation_source_facts_max_tokens_per_observation": 128,
+        })
+
+        try:
+            with (
+                patch.object(memory._config_resolver, "resolve_full_config", return_value=fake_config),
+                patch.object(memory, "recall_async", wraps=memory.recall_async) as mock_recall,
+            ):
+                await _find_related_observations(
+                    memory_engine=memory,
+                    bank_id=bank_id,
+                    query="test query",
+                    request_context=request_context,
+                )
+                assert mock_recall.called
+                _, kwargs = mock_recall.call_args
+                assert kwargs.get("max_source_facts_tokens") == -1
+                assert kwargs.get("max_source_facts_tokens_per_observation") == 128
+        finally:
+            await memory.delete_bank(bank_id, request_context=request_context)

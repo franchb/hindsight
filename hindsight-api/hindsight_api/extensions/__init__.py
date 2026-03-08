@@ -22,9 +22,16 @@ from hindsight_api.extensions.http import HttpExtension
 from hindsight_api.extensions.loader import load_extension
 from hindsight_api.extensions.mcp import MCPExtension
 from hindsight_api.extensions.operation_validator import (
+    # Bank Management operations
+    BankListContext,
+    BankListResult,
+    BankReadContext,
+    BankWriteContext,
     # Consolidation operation
     ConsolidateContext,
     ConsolidateResult,
+    # File Conversion
+    FileConvertResult,
     # Mental Model operations
     MentalModelGetContext,
     MentalModelGetResult,
@@ -70,9 +77,16 @@ __all__ = [
     "RetainContext",
     "RetainResult",
     "ValidationResult",
+    # Operation Validator - Bank Management
+    "BankListContext",
+    "BankListResult",
+    "BankReadContext",
+    "BankWriteContext",
     # Operation Validator - Consolidation
     "ConsolidateContext",
     "ConsolidateResult",
+    # Operation Validator - File Conversion
+    "FileConvertResult",
     # Operation Validator - Mental Model
     "MentalModelGetContext",
     "MentalModelGetResult",

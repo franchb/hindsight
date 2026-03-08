@@ -90,6 +90,12 @@ The same entity mentioned different ways gets unified:
 
 If "Alice" appears with "Google" and "Stanford" multiple times, a new "Alice" mentioning those is likely the same person. Hindsight uses co-occurrence patterns to disambiguate common names.
 
+### Entity Labels
+
+You can define a controlled vocabulary of `key:value` classification labels (e.g. `pedagogy:scaffolding`, `engagement:active`) that are extracted at retain time and stored as entities. Because labels become entities, they automatically link related memories in the knowledge graph and improve both semantic and keyword retrieval. Labels can optionally also write to the memory unit's tags, enabling standard tag-based filtering during recall and reflect.
+
+See [entity_labels in the bank config](/developer/api/memory-banks#entity-labels) for full configuration details.
+
 ---
 
 ## Building Connections
@@ -173,6 +179,29 @@ After `retain()` completes:
 - **Optional tags** for filtering during recall
 
 All stored in your isolated **memory bank**, ready for `recall()` and `reflect()`.
+
+---
+
+## Steering Extraction with a Mission
+
+By default, `retain()` extracts all significant facts from the content. You can narrow this focus with a **retain mission** (`retain_mission`) — a plain-language description of what this bank should pay attention to.
+
+```
+e.g. Always include technical decisions, API design choices, and architectural trade-offs.
+     Ignore meeting logistics, greetings, and social exchanges.
+```
+
+The mission is injected into the extraction prompt alongside the built-in rules — it steers the LLM without replacing the extraction logic. It works with any extraction mode (`concise`, `verbose`, `custom`).
+
+For finer control, you can also change the **extraction mode**:
+
+| Mode | When to use |
+|------|-------------|
+| `concise` *(default)* | General-purpose — selective, fast |
+| `verbose` | When you need richer facts with full context and relationships |
+| `custom` | When you want to write your own extraction rules entirely |
+
+Set `retain_mission` and `retain_extraction_mode` via the [bank config API](/developer/api/memory-banks#retain-configuration) or the [`HINDSIGHT_API_RETAIN_MISSION`](/developer/configuration#retain) environment variable.
 
 ---
 

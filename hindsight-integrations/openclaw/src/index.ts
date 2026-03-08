@@ -1,12 +1,20 @@
-import type { MoltbotPluginAPI, PluginConfig } from './types.js';
+import type { MoltbotPluginAPI, PluginConfig, PluginHookAgentContext, MemoryResult } from './types.js';
 import { HindsightEmbedManager } from './embed-manager.js';
 import { HindsightClient, type HindsightClientOptions } from './client.js';
+import { createHash } from 'crypto';
 import { dirname } from 'path';
 import { fileURLToPath } from 'url';
+
+// Debug logging: silent by default, enable with debug: true in plugin config
+let debugEnabled = false;
+const debug = (...args: unknown[]) => {
+  if (debugEnabled) console.log(...args);
+};
 
 // Module-level state
 let embedManager: HindsightEmbedManager | null = null;
 let client: HindsightClient | null = null;
+let clientOptions: HindsightClientOptions | null = null;
 let initPromise: Promise<void> | null = null;
 let isInitialized = false;
 let usingExternalApi = false; // Track if using external API (skip daemon management)
@@ -16,16 +24,41 @@ let currentPluginConfig: PluginConfig | null = null;
 
 // Track which banks have had their mission set (to avoid re-setting on every request)
 const banksWithMissionSet = new Set<string>();
+// Use dedicated client instances per bank to avoid cross-session bankId mutation races.
+const clientsByBankId = new Map<string, HindsightClient>();
+const MAX_TRACKED_BANK_CLIENTS = 10_000;
 
 // In-flight recall deduplication: concurrent recalls for the same bank reuse one promise
 import type { RecallResponse } from './types.js';
 const inflightRecalls = new Map<string, Promise<RecallResponse>>();
+const turnCountBySession = new Map<string, number>();
+const MAX_TRACKED_SESSIONS = 10_000;
 const RECALL_TIMEOUT_MS = 10_000;
+
+// Cache sender IDs discovered in before_prompt_build (where event.prompt has the metadata
+// blocks) so agent_end can look them up — event.messages in agent_end is clean history.
+const senderIdBySession = new Map<string, string>();
+
+// Guard against double hook registration on the same api instance
+// Uses a WeakSet so each api instance can only register hooks once
+const registeredApis = new WeakSet<object>();
 
 // Cooldown + guard to prevent concurrent reinit attempts
 let lastReinitAttempt = 0;
 let isReinitInProgress = false;
 const REINIT_COOLDOWN_MS = 30_000;
+
+const DEFAULT_RECALL_PROMPT_PREAMBLE =
+  'Relevant memories from past conversations (prioritize recent when conflicting). Only use memories that are directly useful to continue this conversation; ignore the rest:';
+
+function formatCurrentTimeForRecall(date = new Date()): string {
+  const year = date.getUTCFullYear();
+  const month = String(date.getUTCMonth() + 1).padStart(2, '0');
+  const day = String(date.getUTCDate()).padStart(2, '0');
+  const hours = String(date.getUTCHours()).padStart(2, '0');
+  const minutes = String(date.getUTCMinutes()).padStart(2, '0');
+  return `${year}-${month}-${day} ${hours}:${minutes}`;
+}
 
 /**
  * Lazy re-initialization after startup failure.
@@ -52,7 +85,7 @@ async function lazyReinit(): Promise<void> {
     return; // Only external API mode supports lazy reinit
   }
 
-  console.log('[Hindsight] Attempting lazy re-initialization...');
+  debug('[Hindsight] Attempting lazy re-initialization...');
   try {
     await checkExternalApiHealth(externalApi.apiUrl, externalApi.apiToken);
 
@@ -63,7 +96,10 @@ async function lazyReinit(): Promise<void> {
     }
 
     const llmConfig = detectLLMConfig(config);
-    client = new HindsightClient(buildClientOptions(llmConfig, config, externalApi));
+    clientOptions = buildClientOptions(llmConfig, config, externalApi);
+    clientsByBankId.clear();
+    banksWithMissionSet.clear();
+    client = new HindsightClient(clientOptions);
     const defaultBankId = deriveBankId(undefined, config);
     client.setBankId(defaultBankId);
 
@@ -75,7 +111,7 @@ async function lazyReinit(): Promise<void> {
     isInitialized = true;
     // Replace the rejected initPromise with a resolved one
     initPromise = Promise.resolve();
-    console.log('[Hindsight] ✓ Lazy re-initialization succeeded');
+    debug('[Hindsight] ✓ Lazy re-initialization succeeded');
   } catch (error) {
     console.warn(`[Hindsight] Lazy re-initialization failed (will retry in ${REINIT_COOLDOWN_MS / 1000}s):`, error instanceof Error ? error.message : error);
   } finally {
@@ -110,22 +146,40 @@ if (typeof global !== 'undefined') {
     getClientForContext: async (ctx: PluginHookAgentContext | undefined) => {
       if (!client) {return null;}
       const config = currentPluginConfig || {};
+      if (config.dynamicBankId === false) {
+        return client;
+      }
       const bankId = deriveBankId(ctx, config);
-      client.setBankId(bankId);
+      let bankClient = clientsByBankId.get(bankId);
+      if (!bankClient) {
+        if (!clientOptions) {
+          return null;
+        }
+        bankClient = new HindsightClient(clientOptions);
+        bankClient.setBankId(bankId);
+        clientsByBankId.set(bankId, bankClient);
+        if (clientsByBankId.size > MAX_TRACKED_BANK_CLIENTS) {
+          const oldestKey = clientsByBankId.keys().next().value;
+          if (oldestKey) {
+            clientsByBankId.delete(oldestKey);
+            banksWithMissionSet.delete(oldestKey);
+          }
+        }
+      }
 
       // Set bank mission on first use of this bank (if configured)
       if (config.bankMission && config.dynamicBankId && !banksWithMissionSet.has(bankId)) {
         try {
-          await client.setBankMission(config.bankMission);
+          await bankClient.setBankMission(config.bankMission);
           banksWithMissionSet.add(bankId);
-          console.log(`[Hindsight] Set mission for new bank: ${bankId}`);
+          debug(`[Hindsight] Set mission for new bank: ${bankId}`);
         } catch (error) {
           // Log but don't fail - bank mission is not critical
           console.warn(`[Hindsight] Could not set bank mission for ${bankId}: ${error}`);
         }
       }
 
-      return client;
+      return bankClient;
     },
     getPluginConfig: () => currentPluginConfig,
   };
@@ -150,6 +204,39 @@ export function stripMemoryTags(content: string): string {
 }
 
 /**
+ * Extract sender_id from OpenClaw's injected inbound metadata blocks.
+ * Checks both "Conversation info (untrusted metadata)" and "Sender (untrusted metadata)" blocks.
+ * Returns the first sender_id / id string found, or undefined if none.
+ */
+export function extractSenderIdFromText(text: string): string | undefined {
+  if (!text) return undefined;
+  const metaBlockRe = /[\w\s]+\(untrusted metadata\)[^\n]*\n```json\n([\s\S]*?)\n```/gi;
+  let match: RegExpExecArray | null;
+  while ((match = metaBlockRe.exec(text)) !== null) {
+    try {
+      const obj = JSON.parse(match[1]);
+      const id = obj?.sender_id ?? obj?.id;
+      if (id && typeof id === 'string') return id;
+    } catch {
+      // continue to next block
+    }
+  }
+  return undefined;
+}
+
+/**
+ * Strip OpenClaw sender/conversation metadata envelopes from message content.
+ * These blocks are injected by OpenClaw but are noise for memory storage and recall.
+ */
+export function stripMetadataEnvelopes(content: string): string {
+  // Strip: ---\n<Label> (untrusted metadata):\n```json\n{...}\n```\n<message>\n---
+  content = content.replace(/^---\n[\w\s]+\(untrusted metadata\)[^\n]*\n```json[\s\S]*?```\n\n?/im, '').replace(/\n---$/, '');
+  // Strip: <Label> (untrusted metadata):\n```json\n{...}\n```  (without --- wrapper)
+  content = content.replace(/[\w\s]+\(untrusted metadata\)[^\n]*\n```json[\s\S]*?```\n?/gim, '');
+  return content.trim();
+}
+
+/**
  * Extract a recall query from a hook event's rawMessage or prompt.
  *
  * Prefers rawMessage (clean user text). Falls back to prompt, stripping
@@ -161,10 +248,26 @@ export function extractRecallQuery(
   rawMessage: string | undefined,
   prompt: string | undefined,
 ): string | null {
+  // Reject known metadata/system message patterns — these are not user queries
+  const METADATA_PATTERNS = [
+    /^\s*conversation info\s*\(untrusted metadata\)/i,
+    /^\s*\(untrusted metadata\)/i,
+    /^\s*system:/i,
+  ];
+  const isMetadata = (s: string) => METADATA_PATTERNS.some(p => p.test(s));
+
   let recallQuery = rawMessage;
-  if (!recallQuery || typeof recallQuery !== 'string' || recallQuery.trim().length < 5) {
+  // Strip sender metadata envelope before any checks
+  if (recallQuery) {
+    recallQuery = stripMetadataEnvelopes(recallQuery);
+  }
+  if (!recallQuery || typeof recallQuery !== 'string' || recallQuery.trim().length < 5 || isMetadata(recallQuery)) {
     recallQuery = prompt;
-    if (!recallQuery || typeof recallQuery !== 'string' || recallQuery.length < 5) {
+    // Strip metadata envelopes from prompt too, then check if anything useful remains
+    if (recallQuery) {
+      recallQuery = stripMetadataEnvelopes(recallQuery);
+    }
+    if (!recallQuery || recallQuery.length < 5) {
       return null;
     }
 
@@ -191,52 +294,205 @@ export function extractRecallQuery(
     // Remove trailing [from: SenderName] metadata (group chats)
     cleaned = cleaned.replace(/\n\[from:[^\]]*\]\s*$/, '');
 
+    // Strip metadata envelopes again after channel envelope extraction, in case
+    // the metadata block appeared after the [ChannelName] header
+    cleaned = stripMetadataEnvelopes(cleaned);
+
     recallQuery = cleaned.trim() || recallQuery;
   }
 
   const trimmed = recallQuery.trim();
-  if (trimmed.length < 5) return null;
+  if (trimmed.length < 5 || isMetadata(trimmed)) return null;
   return trimmed;
 }
 
-/**
- * Agent context passed to plugin hooks.
- * These fields are populated by OpenClaw when invoking hooks.
- */
-interface PluginHookAgentContext {
-  agentId?: string;
-  sessionKey?: string;
-  workspaceDir?: string;
-  messageProvider?: string;
-  channelId?: string;
-  senderId?: string;
+export function composeRecallQuery(
+  latestQuery: string,
+  messages: any[] | undefined,
+  recallContextTurns: number,
+  recallRoles: Array<'user' | 'assistant' | 'system' | 'tool'> = ['user', 'assistant'],
+): string {
+  const latest = latestQuery.trim();
+  if (recallContextTurns <= 1 || !Array.isArray(messages) || messages.length === 0) {
+    return latest;
+  }
+
+  const allowedRoles = new Set(recallRoles);
+  const contextualMessages = sliceLastTurnsByUserBoundary(messages, recallContextTurns);
+  const contextLines = contextualMessages
+    .map((msg: any) => {
+      const role = msg?.role;
+      if (!allowedRoles.has(role)) {
+        return null;
+      }
+
+      let content = '';
+      if (typeof msg?.content === 'string') {
+        content = msg.content;
+      } else if (Array.isArray(msg?.content)) {
+        content = msg.content
+          .filter((block: any) => block?.type === 'text' && typeof block?.text === 'string')
+          .map((block: any) => block.text)
+          .join('\n');
+      }
+
+      content = stripMemoryTags(content).trim();
+      content = stripMetadataEnvelopes(content);
+      if (!content) {
+        return null;
+      }
+      if (role === 'user' && content === latest) {
+        return null;
+      }
+      return `${role}: ${content}`;
+    })
+    .filter((line: string | null): line is string => Boolean(line));
+
+  if (contextLines.length === 0) {
+    return latest;
+  }
+
+  return [
+    'Prior context:',
+    contextLines.join('\n'),
+    latest,
+  ].join('\n\n');
+}
+
+export function truncateRecallQuery(query: string, latestQuery: string, maxChars: number): string {
+  if (maxChars <= 0) {
+    return query;
+  }
+
+  const latest = latestQuery.trim();
+  if (query.length <= maxChars) {
+    return query;
+  }
+
+  const latestOnly = latest.length <= maxChars ? latest : latest.slice(0, maxChars);
+
+  if (!query.includes('Prior context:')) {
+    return latestOnly;
+  }
+
+  // New order: Prior context at top, latest user message at bottom.
+  // Truncate by dropping oldest context lines first to preserve the suffix.
+  const contextMarker = 'Prior context:\n\n';
+  const markerIndex = query.indexOf(contextMarker);
+  if (markerIndex === -1) {
+    return latestOnly;
+  }
+
+  const suffixMarker = '\n\n' + latest;
+  const suffixIndex = query.lastIndexOf(suffixMarker);
+  if (suffixIndex === -1) {
+    return latestOnly;
+  }
+
+  const suffix = query.slice(suffixIndex); // \n\n<latest>
+  if (suffix.length >= maxChars) {
+    return latestOnly;
+  }
+
+  const contextBody = query.slice(markerIndex + contextMarker.length, suffixIndex);
+  const contextLines = contextBody.split('\n').filter(Boolean);
+  const keptContextLines: string[] = [];
+
+  // Add context lines from newest (bottom) to oldest (top), stopping when we exceed maxChars
+  for (let i = contextLines.length - 1; i >= 0; i--) {
+    keptContextLines.unshift(contextLines[i]);
+    const candidate = `${contextMarker}${keptContextLines.join('\n')}${suffix}`;
+    if (candidate.length > maxChars) {
+      keptContextLines.shift();
+      break;
+    }
+  }
+
+  if (keptContextLines.length > 0) {
+    return `${contextMarker}${keptContextLines.join('\n')}${suffix}`;
+  }
+
+  return latestOnly;
 }
 
 /**
  * Derive a bank ID from the agent context.
- * Creates per-user banks: {messageProvider}-{senderId}
+ * Uses configurable dynamicBankGranularity to determine bank segmentation.
  * Falls back to default bank when context is unavailable.
  */
-function deriveBankId(
-  ctx: PluginHookAgentContext | undefined,
-  pluginConfig: PluginConfig
-): string {
-  // If dynamic bank ID is disabled, use static bank
+/**
+ * Parse the OpenClaw sessionKey to extract context fields.
+ * Format: "agent:{agentId}:{provider}:{channelType}:{channelId}[:{extra}]"
+ * Example: "agent:c0der:telegram:group:-1003825475854:topic:42"
+ */
+function parseSessionKey(sessionKey: string): { agentId?: string; provider?: string; channel?: string } {
+  const parts = sessionKey.split(':');
+  if (parts.length < 5 || parts[0] !== 'agent') return {};
+  // parts[1] = agentId, parts[2] = provider, parts[3] = channelType, parts[4..] = channelId + extras
+  return {
+    agentId: parts[1],
+    provider: parts[2],
+    // Rejoin from channelType onward as the channel identifier (e.g. "group:-1003825475854:topic:42")
+    channel: parts.slice(3).join(':'),
+  };
+}
+
+export function deriveBankId(ctx: PluginHookAgentContext | undefined, pluginConfig: PluginConfig): string {
   if (pluginConfig.dynamicBankId === false) {
-    return pluginConfig.bankIdPrefix
-      ? `${pluginConfig.bankIdPrefix}-${DEFAULT_BANK_NAME}`
-      : DEFAULT_BANK_NAME;
+    return pluginConfig.bankIdPrefix ? `${pluginConfig.bankIdPrefix}-openclaw` : 'openclaw';
   }
 
-  const channelType = ctx?.messageProvider || 'unknown';
-  const userId = ctx?.senderId || 'default';
+  // When no context is available, fall back to the static default bank.
+  if (!ctx) {
+    return pluginConfig.bankIdPrefix ? `${pluginConfig.bankIdPrefix}-openclaw` : 'openclaw';
+  }
 
-  // Build bank ID: {prefix?}-{channelType}-{senderId}
-  const baseBankId = `${channelType}-${userId}`;
+  const fields = pluginConfig.dynamicBankGranularity?.length ? pluginConfig.dynamicBankGranularity : ['agent', 'channel', 'user'];
+
+  // Validate field names at runtime — typos silently produce 'unknown' segments
+  const validFields = new Set(['agent', 'channel', 'user', 'provider']);
+  for (const f of fields) {
+    if (!validFields.has(f)) {
+      console.warn(`[Hindsight] Unknown dynamicBankGranularity field "${f}" — will resolve to "unknown" in bank ID. Valid fields: agent, channel, user, provider`);
+    }
+  }
+
+  // Parse sessionKey as fallback when direct context fields are missing
+  const sessionParsed = ctx?.sessionKey ? parseSessionKey(ctx.sessionKey) : {};
+
+  // Warn when 'user' is in active fields but senderId is missing — bank ID will contain "anonymous"
+  if (fields.includes('user') && ctx && !ctx.senderId) {
+    debug('[Hindsight] senderId not available in context — bank ID will use "anonymous". Ensure your OpenClaw provider passes senderId.');
+  }
+
+  const fieldMap: Record<string, string> = {
+    agent: ctx?.agentId || sessionParsed.agentId || 'default',
+    channel: ctx?.channelId || sessionParsed.channel || 'unknown',
+    user: ctx?.senderId || 'anonymous',
+    provider: ctx?.messageProvider || sessionParsed.provider || 'unknown',
+  };
+
+  const baseBankId = fields
+    .map(f => encodeURIComponent(fieldMap[f] || 'unknown'))
+    .join('::');
+
   return pluginConfig.bankIdPrefix
     ? `${pluginConfig.bankIdPrefix}-${baseBankId}`
     : baseBankId;
 }
+
+
+export function formatMemories(results: MemoryResult[]): string {
+  if (!results || results.length === 0) return '';
+  return results
+    .map(r => {
+      const type = r.type ? ` [${r.type}]` : '';
+      const date = r.mentioned_at ? ` (${r.mentioned_at})` : '';
+      return `- ${r.text}${type}${date}`;
+    })
+    .join('\n\n');
+}
+
 
 // Provider detection from standard env vars
 const PROVIDER_DETECTION = [
@@ -250,8 +506,8 @@ const PROVIDER_DETECTION = [
 ];
 
 function detectLLMConfig(pluginConfig?: PluginConfig): {
-  provider: string;
-  apiKey: string;
+  provider?: string;
+  apiKey?: string;
   model?: string;
   baseUrl?: string;
   source: string;
@@ -337,6 +593,19 @@ function detectLLMConfig(pluginConfig?: PluginConfig): {
   }
 
   // No configuration found - show helpful error
+
+  // Allow empty LLM config if using external Hindsight API (server handles LLM)
+  const externalApiCheck = detectExternalApi(pluginConfig);
+  if (externalApiCheck.apiUrl) {
+    return {
+      provider: undefined,
+      apiKey: undefined,
+      model: undefined,
+      baseUrl: undefined,
+      source: 'external-api-mode-no-llm',
+    };
+  }
+
   throw new Error(
     `No LLM configuration found for Hindsight memory plugin.\n\n` +
     `Option 1: Set a standard provider API key (auto-detect):\n` +
@@ -375,13 +644,11 @@ function detectExternalApi(pluginConfig?: PluginConfig): {
  * Build HindsightClientOptions from LLM config, plugin config, and external API settings.
  */
 function buildClientOptions(
-  llmConfig: { provider: string; apiKey: string; model?: string },
+  llmConfig: { provider?: string; apiKey?: string; model?: string },
   pluginCfg: PluginConfig,
   externalApi: { apiUrl: string | null; apiToken: string | null },
 ): HindsightClientOptions {
   return {
-    llmProvider: llmConfig.provider,
-    llmApiKey: llmConfig.apiKey,
     llmModel: llmConfig.model,
     embedVersion: pluginCfg.embedVersion,
     embedPackagePath: pluginCfg.embedPackagePath,
@@ -401,7 +668,7 @@ async function checkExternalApiHealth(apiUrl: string, apiToken?: string | null):
 
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
     try {
-      console.log(`[Hindsight] Checking external API health at ${healthUrl}... (attempt ${attempt}/${maxRetries})`);
+      debug(`[Hindsight] Checking external API health at ${healthUrl}... (attempt ${attempt}/${maxRetries})`);
       const headers: Record<string, string> = {};
       if (apiToken) {
         headers['Authorization'] = `Bearer ${apiToken}`;
@@ -411,11 +678,11 @@ async function checkExternalApiHealth(apiUrl: string, apiToken?: string | null):
         throw new Error(`HTTP ${response.status}: ${response.statusText}`);
       }
       const data = await response.json() as { status?: string };
-      console.log(`[Hindsight] External API health: ${JSON.stringify(data)}`);
+      debug(`[Hindsight] External API health: ${JSON.stringify(data)}`);
       return;
     } catch (error) {
       if (attempt < maxRetries) {
-        console.log(`[Hindsight] Health check attempt ${attempt} failed, retrying in ${retryDelay}ms...`);
+        debug(`[Hindsight] Health check attempt ${attempt} failed, retrying in ${retryDelay}ms...`);
         await new Promise(resolve => setTimeout(resolve, retryDelay));
       } else {
         throw new Error(`Cannot connect to external Hindsight API at ${apiUrl}: ${error}`, { cause: error });
@@ -445,42 +712,59 @@ function getPluginConfig(api: MoltbotPluginAPI): PluginConfig {
     bankIdPrefix: config.bankIdPrefix,
     excludeProviders: Array.isArray(config.excludeProviders) ? config.excludeProviders : [],
     autoRecall: config.autoRecall !== false, // Default: true (on) — backward compatible
+    dynamicBankGranularity: Array.isArray(config.dynamicBankGranularity) ? config.dynamicBankGranularity : undefined,
+    autoRetain: config.autoRetain !== false, // Default: true
+    retainRoles: Array.isArray(config.retainRoles) ? config.retainRoles : undefined,
+    recallBudget: config.recallBudget || 'mid',
+    recallMaxTokens: config.recallMaxTokens || 1024,
+    recallTypes: Array.isArray(config.recallTypes) ? config.recallTypes : ['world', 'experience'],
+    recallRoles: Array.isArray(config.recallRoles) ? config.recallRoles : ['user', 'assistant'],
+    retainEveryNTurns: typeof config.retainEveryNTurns === 'number' && config.retainEveryNTurns >= 1 ? config.retainEveryNTurns : 1,
+    retainOverlapTurns: typeof config.retainOverlapTurns === 'number' && config.retainOverlapTurns >= 0 ? config.retainOverlapTurns : 0,
+    recallTopK: typeof config.recallTopK === 'number' ? config.recallTopK : undefined,
+    recallContextTurns: typeof config.recallContextTurns === 'number' && config.recallContextTurns >= 1 ? config.recallContextTurns : 1,
+    recallMaxQueryChars: typeof config.recallMaxQueryChars === 'number' && config.recallMaxQueryChars >= 1 ? config.recallMaxQueryChars : 800,
+    recallPromptPreamble:
+      typeof config.recallPromptPreamble === 'string' && config.recallPromptPreamble.trim().length > 0
+        ? config.recallPromptPreamble
+        : DEFAULT_RECALL_PROMPT_PREAMBLE,
+    debug: config.debug ?? false,
   };
 }
 
 export default function (api: MoltbotPluginAPI) {
   try {
-    console.log('[Hindsight] Plugin loading...');
+    debug('[Hindsight] Plugin loading...');
 
-    // Get plugin config first (needed for LLM detection)
-    console.log('[Hindsight] Getting plugin config...');
+    // Get plugin config first (needed for LLM detection and debug flag)
     const pluginConfig = getPluginConfig(api);
+    debugEnabled = pluginConfig.debug ?? false;
 
     // Store config globally for bank ID derivation in hooks
     currentPluginConfig = pluginConfig;
 
     // Detect LLM configuration (env vars > plugin config > auto-detect)
-    console.log('[Hindsight] Detecting LLM config...');
+    debug('[Hindsight] Detecting LLM config...');
     const llmConfig = detectLLMConfig(pluginConfig);
 
     const baseUrlInfo = llmConfig.baseUrl ? `, base URL: ${llmConfig.baseUrl}` : '';
     const modelInfo = llmConfig.model || 'default';
 
     if (llmConfig.provider === 'ollama') {
-      console.log(`[Hindsight] ✓ Using provider: ${llmConfig.provider}, model: ${modelInfo} (${llmConfig.source})`);
+      debug(`[Hindsight] ✓ Using provider: ${llmConfig.provider}, model: ${modelInfo} (${llmConfig.source})`);
     } else {
-      console.log(`[Hindsight] ✓ Using provider: ${llmConfig.provider}, model: ${modelInfo} (${llmConfig.source}${baseUrlInfo})`);
+      debug(`[Hindsight] ✓ Using provider: ${llmConfig.provider}, model: ${modelInfo} (${llmConfig.source}${baseUrlInfo})`);
     }
     if (pluginConfig.bankMission) {
-      console.log(`[Hindsight] Custom bank mission configured: "${pluginConfig.bankMission.substring(0, 50)}..."`);
+      debug(`[Hindsight] Custom bank mission configured: "${pluginConfig.bankMission.substring(0, 50)}..."`);
     }
 
     // Log dynamic bank ID mode
     if (pluginConfig.dynamicBankId) {
       const prefixInfo = pluginConfig.bankIdPrefix ? ` (prefix: ${pluginConfig.bankIdPrefix})` : '';
-      console.log(`[Hindsight] ✓ Dynamic bank IDs enabled${prefixInfo} - each channel gets isolated memory`);
+      debug(`[Hindsight] ✓ Dynamic bank IDs enabled${prefixInfo} - each channel gets isolated memory`);
     } else {
-      console.log(`[Hindsight] Dynamic bank IDs disabled - using static bank: ${DEFAULT_BANK_NAME}`);
+      debug(`[Hindsight] Dynamic bank IDs disabled - using static bank: ${DEFAULT_BANK_NAME}`);
     }
 
     // Detect external API mode
@@ -492,53 +776,56 @@ export default function (api: MoltbotPluginAPI) {
     if (externalApi.apiUrl) {
       // External API mode - skip local daemon
       usingExternalApi = true;
-      console.log(`[Hindsight] ✓ Using external API: ${externalApi.apiUrl}`);
+      debug(`[Hindsight] ✓ Using external API: ${externalApi.apiUrl}`);
 
       // Set env vars so CLI commands (uvx hindsight-embed) use external API
       process.env.HINDSIGHT_EMBED_API_URL = externalApi.apiUrl;
       if (externalApi.apiToken) {
         process.env.HINDSIGHT_EMBED_API_TOKEN = externalApi.apiToken;
-        console.log('[Hindsight] API token configured');
+        debug('[Hindsight] API token configured');
       }
     } else {
-      console.log(`[Hindsight] Daemon idle timeout: ${pluginConfig.daemonIdleTimeout}s (0 = never timeout)`);
-      console.log(`[Hindsight] API Port: ${apiPort}`);
+      debug(`[Hindsight] Daemon idle timeout: ${pluginConfig.daemonIdleTimeout}s (0 = never timeout)`);
+      debug(`[Hindsight] API Port: ${apiPort}`);
     }
 
     // Initialize in background (non-blocking)
-    console.log('[Hindsight] Starting initialization in background...');
+    debug('[Hindsight] Starting initialization in background...');
     initPromise = (async () => {
       try {
         if (usingExternalApi && externalApi.apiUrl) {
           // External API mode - check health, skip daemon startup
-          console.log('[Hindsight] External API mode - skipping local daemon...');
+          debug('[Hindsight] External API mode - skipping local daemon...');
           await checkExternalApiHealth(externalApi.apiUrl, externalApi.apiToken);
 
           // Initialize client with direct HTTP mode
-          console.log('[Hindsight] Creating HindsightClient (HTTP mode)...');
-          client = new HindsightClient(buildClientOptions(llmConfig, pluginConfig, externalApi));
+          debug('[Hindsight] Creating HindsightClient (HTTP mode)...');
+          clientOptions = buildClientOptions(llmConfig, pluginConfig, externalApi);
+          clientsByBankId.clear();
+          banksWithMissionSet.clear();
+          client = new HindsightClient(clientOptions);
 
           // Set default bank (will be overridden per-request when dynamic bank IDs are enabled)
           const defaultBankId = deriveBankId(undefined, pluginConfig);
-          console.log(`[Hindsight] Default bank: ${defaultBankId}`);
+          debug(`[Hindsight] Default bank: ${defaultBankId}`);
           client.setBankId(defaultBankId);
 
           // Note: Bank mission will be set per-bank when dynamic bank IDs are enabled
           // For now, set it on the default bank
           if (pluginConfig.bankMission && !pluginConfig.dynamicBankId) {
-            console.log(`[Hindsight] Setting bank mission...`);
+            debug(`[Hindsight] Setting bank mission...`);
             await client.setBankMission(pluginConfig.bankMission);
           }
 
           isInitialized = true;
-          console.log('[Hindsight] ✓ Ready (external API mode)');
+          debug('[Hindsight] ✓ Ready (external API mode)');
         } else {
           // Local daemon mode - start hindsight-embed daemon
-          console.log('[Hindsight] Creating HindsightEmbedManager...');
+          debug('[Hindsight] Creating HindsightEmbedManager...');
           embedManager = new HindsightEmbedManager(
             apiPort,
-            llmConfig.provider,
-            llmConfig.apiKey,
+            llmConfig.provider || "",
+            llmConfig.apiKey || "",
             llmConfig.model,
             llmConfig.baseUrl,
             pluginConfig.daemonIdleTimeout,
@@ -547,27 +834,30 @@ export default function (api: MoltbotPluginAPI) {
           );
 
           // Start the embedded server
-          console.log('[Hindsight] Starting embedded server...');
+          debug('[Hindsight] Starting embedded server...');
           await embedManager.start();
 
           // Initialize client (local daemon mode — no apiUrl)
-          console.log('[Hindsight] Creating HindsightClient (subprocess mode)...');
-          client = new HindsightClient(buildClientOptions(llmConfig, pluginConfig, { apiUrl: null, apiToken: null }));
+          debug('[Hindsight] Creating HindsightClient (subprocess mode)...');
+          clientOptions = buildClientOptions(llmConfig, pluginConfig, { apiUrl: null, apiToken: null });
+          clientsByBankId.clear();
+          banksWithMissionSet.clear();
+          client = new HindsightClient(clientOptions);
 
           // Set default bank (will be overridden per-request when dynamic bank IDs are enabled)
           const defaultBankId = deriveBankId(undefined, pluginConfig);
-          console.log(`[Hindsight] Default bank: ${defaultBankId}`);
+          debug(`[Hindsight] Default bank: ${defaultBankId}`);
           client.setBankId(defaultBankId);
 
           // Note: Bank mission will be set per-bank when dynamic bank IDs are enabled
           // For now, set it on the default bank
           if (pluginConfig.bankMission && !pluginConfig.dynamicBankId) {
-            console.log(`[Hindsight] Setting bank mission...`);
+            debug(`[Hindsight] Setting bank mission...`);
             await client.setBankMission(pluginConfig.bankMission);
           }
 
           isInitialized = true;
-          console.log('[Hindsight] ✓ Ready');
+          debug('[Hindsight] ✓ Ready');
         }
       } catch (error) {
         console.error('[Hindsight] Initialization error:', error);
@@ -579,11 +869,11 @@ export default function (api: MoltbotPluginAPI) {
     initPromise.catch(() => {});
 
     // Register background service for cleanup
-    console.log('[Hindsight] Registering service...');
+    debug('[Hindsight] Registering service...');
     api.registerService({
       id: 'hindsight-memory',
       async start() {
-        console.log('[Hindsight] Service start called...');
+        debug('[Hindsight] Service start called...');
 
         // Wait for background init if still pending
         if (initPromise) {
@@ -601,12 +891,15 @@ export default function (api: MoltbotPluginAPI) {
           if (externalApi.apiUrl && isInitialized) {
             try {
               await checkExternalApiHealth(externalApi.apiUrl, externalApi.apiToken);
-              console.log('[Hindsight] External API is healthy');
+              debug('[Hindsight] External API is healthy');
               return;
             } catch (error) {
               console.error('[Hindsight] External API health check failed:', error);
               // Reset state for reinitialization attempt
               client = null;
+              clientOptions = null;
+              clientsByBankId.clear();
+              banksWithMissionSet.clear();
               isInitialized = false;
             }
           }
@@ -615,21 +908,24 @@ export default function (api: MoltbotPluginAPI) {
           if (embedManager && isInitialized) {
             const healthy = await embedManager.checkHealth();
             if (healthy) {
-              console.log('[Hindsight] Daemon is healthy');
+              debug('[Hindsight] Daemon is healthy');
               return;
             }
 
-            console.log('[Hindsight] Daemon is not responding - reinitializing...');
+            debug('[Hindsight] Daemon is not responding - reinitializing...');
             // Reset state for reinitialization
             embedManager = null;
             client = null;
+            clientOptions = null;
+            clientsByBankId.clear();
+            banksWithMissionSet.clear();
             isInitialized = false;
           }
         }
 
         // Reinitialize if needed (fresh start or recovery)
         if (!isInitialized) {
-          console.log('[Hindsight] Reinitializing...');
+          debug('[Hindsight] Reinitializing...');
           const reinitPluginConfig = getPluginConfig(api);
           currentPluginConfig = reinitPluginConfig;
           const llmConfig = detectLLMConfig(reinitPluginConfig);
@@ -646,7 +942,10 @@ export default function (api: MoltbotPluginAPI) {
 
             await checkExternalApiHealth(externalApi.apiUrl, externalApi.apiToken);
 
-            client = new HindsightClient(buildClientOptions(llmConfig, reinitPluginConfig, externalApi));
+            clientOptions = buildClientOptions(llmConfig, reinitPluginConfig, externalApi);
+            clientsByBankId.clear();
+            banksWithMissionSet.clear();
+            client = new HindsightClient(clientOptions);
             const defaultBankId = deriveBankId(undefined, reinitPluginConfig);
             client.setBankId(defaultBankId);
 
@@ -655,13 +954,13 @@ export default function (api: MoltbotPluginAPI) {
             }
 
             isInitialized = true;
-            console.log('[Hindsight] Reinitialization complete (external API mode)');
+            debug('[Hindsight] Reinitialization complete (external API mode)');
           } else {
             // Local daemon mode
             embedManager = new HindsightEmbedManager(
               apiPort,
-              llmConfig.provider,
-              llmConfig.apiKey,
+              llmConfig.provider || "",
+              llmConfig.apiKey || "",
               llmConfig.model,
               llmConfig.baseUrl,
               reinitPluginConfig.daemonIdleTimeout,
@@ -671,7 +970,10 @@ export default function (api: MoltbotPluginAPI) {
 
             await embedManager.start();
 
-            client = new HindsightClient(buildClientOptions(llmConfig, reinitPluginConfig, { apiUrl: null, apiToken: null }));
+            clientOptions = buildClientOptions(llmConfig, reinitPluginConfig, { apiUrl: null, apiToken: null });
+            clientsByBankId.clear();
+            banksWithMissionSet.clear();
+            client = new HindsightClient(clientOptions);
             const defaultBankId = deriveBankId(undefined, reinitPluginConfig);
             client.setBankId(defaultBankId);
 
@@ -680,14 +982,14 @@ export default function (api: MoltbotPluginAPI) {
             }
 
             isInitialized = true;
-            console.log('[Hindsight] Reinitialization complete');
+            debug('[Hindsight] Reinitialization complete');
           }
         }
       },
 
       async stop() {
         try {
-          console.log('[Hindsight] Service stopping...');
+          debug('[Hindsight] Service stopping...');
 
           // Only stop daemon if in local mode
           if (!usingExternalApi && embedManager) {
@@ -696,9 +998,12 @@ export default function (api: MoltbotPluginAPI) {
           }
 
           client = null;
+          clientOptions = null;
+          clientsByBankId.clear();
+          banksWithMissionSet.clear();
           isInitialized = false;
 
-          console.log('[Hindsight] Service stopped');
+          debug('[Hindsight] Service stopped');
         } catch (error) {
           console.error('[Hindsight] Service stop error:', error);
           throw error;
@@ -706,82 +1011,109 @@ export default function (api: MoltbotPluginAPI) {
       },
     });
 
-    console.log('[Hindsight] Plugin loaded successfully');
+    debug('[Hindsight] Plugin loaded successfully');
 
     // Register agent hooks for auto-recall and auto-retention
-    console.log('[Hindsight] Registering agent hooks...');
-
-    // Store session key and context for retention
-    let currentSessionKey: string | undefined;
-    let currentAgentContext: PluginHookAgentContext | undefined;
+    if (registeredApis.has(api)) {
+      debug('[Hindsight] Hooks already registered for this api instance, skipping duplicate registration');
+      return;
+    }
+    registeredApis.add(api);
+    debug('[Hindsight] Registering agent hooks...');
 
     // Auto-recall: Inject relevant memories before agent processes the message
     // Hook signature: (event, ctx) where event has {prompt, messages?} and ctx has agent context
-    api.on('before_agent_start', async (event: any, ctx?: PluginHookAgentContext) => {
+    api.on('before_prompt_build', async (event: any, ctx?: PluginHookAgentContext) => {
       try {
-        // Capture session key and context for use in agent_end
-        if (ctx?.sessionKey) {
-          currentSessionKey = ctx.sessionKey;
-        }
-        currentAgentContext = ctx;
-
         // Check if this provider is excluded
         if (ctx?.messageProvider && pluginConfig.excludeProviders?.includes(ctx.messageProvider)) {
-          console.log(`[Hindsight] Skipping recall for excluded provider: ${ctx.messageProvider}`);
+          debug(`[Hindsight] Skipping recall for excluded provider: ${ctx.messageProvider}`);
           return;
         }
 
         // Skip auto-recall when disabled (agent has its own recall tool)
         if (!pluginConfig.autoRecall) {
-          console.log('[Hindsight] Auto-recall disabled via config, skipping');
+          debug('[Hindsight] Auto-recall disabled via config, skipping');
           return;
         }
 
-        // Derive bank ID from context
-        const bankId = deriveBankId(ctx, pluginConfig);
-        console.log(`[Hindsight] before_agent_start - bank: ${bankId}, channel: ${ctx?.messageProvider}/${ctx?.channelId}`);
+        // Derive bank ID from context — enrich ctx.senderId from the inbound metadata
+        // block when it's missing (agent-phase hooks don't carry senderId in ctx directly).
+        const senderIdFromPrompt = !ctx?.senderId ? extractSenderIdFromText(event.prompt ?? event.rawMessage ?? '') : undefined;
+        const effectiveCtxForRecall = senderIdFromPrompt ? { ...ctx, senderId: senderIdFromPrompt } : ctx;
+
+        // Cache the resolved sender ID keyed by sessionKey so agent_end can use it.
+        // event.messages in agent_end is clean history without the metadata blocks.
+        const resolvedSenderId = effectiveCtxForRecall?.senderId;
+        const sessionKeyForCache = ctx?.sessionKey;
+        if (resolvedSenderId && sessionKeyForCache) {
+          senderIdBySession.set(sessionKeyForCache, resolvedSenderId);
+          if (senderIdBySession.size > MAX_TRACKED_SESSIONS) {
+            const oldest = senderIdBySession.keys().next().value;
+            if (oldest) senderIdBySession.delete(oldest);
+          }
+        }
+
+        const bankId = deriveBankId(effectiveCtxForRecall, pluginConfig);
+        debug(`[Hindsight] before_prompt_build - bank: ${bankId}, channel: ${ctx?.messageProvider}/${ctx?.channelId}`);
+        debug(`[Hindsight] event keys: ${Object.keys(event).join(', ')}`);
+        debug(`[Hindsight] event.context keys: ${Object.keys(event.context ?? {}).join(', ')}`);
 
         // Get the user's latest message for recall — only the raw user text, not the full prompt
         // rawMessage is clean user text; prompt includes envelope, system events, media notes, etc.
+        debug(`[Hindsight] extractRecallQuery input lengths - raw: ${event.rawMessage?.length ?? 0}, prompt: ${event.prompt?.length ?? 0}`);
         const extracted = extractRecallQuery(event.rawMessage, event.prompt);
         if (!extracted) {
+          debug('[Hindsight] extractRecallQuery returned null, skipping recall');
           return;
         }
-        let prompt = extracted;
+        debug(`[Hindsight] extractRecallQuery result length: ${extracted.length}`);
+        const recallContextTurns = pluginConfig.recallContextTurns ?? 1;
+        const recallMaxQueryChars = pluginConfig.recallMaxQueryChars ?? 800;
+        const sessionMessages = event.context?.sessionEntry?.messages ?? event.messages ?? [];
+        const messageCount = sessionMessages.length;
+        debug(`[Hindsight] event.messages count: ${messageCount}, roles: ${sessionMessages.map((m: any) => m.role).join(',')}`);
+        if (recallContextTurns > 1 && messageCount === 0) {
+          debug('[Hindsight] recallContextTurns > 1 but event.messages is empty — prior context unavailable at before_agent_start for this provider');
+        }
+        const recallRoles = pluginConfig.recallRoles ?? ['user', 'assistant'];
+        const composedPrompt = composeRecallQuery(extracted, sessionMessages, recallContextTurns, recallRoles);
+        let prompt = truncateRecallQuery(composedPrompt, extracted, recallMaxQueryChars);
 
-        // Truncate — Hindsight API recall has a 500 token limit; 800 chars stays safely under even with non-ASCII
-        const MAX_RECALL_QUERY_CHARS = 800;
-        if (prompt.length > MAX_RECALL_QUERY_CHARS) {
-          prompt = prompt.substring(0, MAX_RECALL_QUERY_CHARS);
+        // Final defensive cap
+        if (prompt.length > recallMaxQueryChars) {
+          prompt = prompt.substring(0, recallMaxQueryChars);
         }
 
         // Wait for client to be ready
         const clientGlobal = (global as any).__hindsightClient;
         if (!clientGlobal) {
-          console.log('[Hindsight] Client global not available, skipping auto-recall');
+          debug('[Hindsight] Client global not available, skipping auto-recall');
           return;
         }
 
         await clientGlobal.waitForReady();
 
         // Get client configured for this context's bank (async to handle mission setup)
-        const client = await clientGlobal.getClientForContext(ctx);
+        const client = await clientGlobal.getClientForContext(effectiveCtxForRecall);
         if (!client) {
-          console.log('[Hindsight] Client not initialized, skipping auto-recall');
+          debug('[Hindsight] Client not initialized, skipping auto-recall');
           return;
         }
 
-        console.log(`[Hindsight] Auto-recall for bank ${bankId}, prompt: ${prompt.substring(0, 50)}`);
+        debug(`[Hindsight] Auto-recall for bank ${bankId}, full query:\n---\n${prompt}\n---`);
 
         // Recall with deduplication: reuse in-flight request for same bank
-        const recallKey = bankId;
+        const normalizedPrompt = prompt.trim().toLowerCase().replace(/\s+/g, ' ');
+        const queryHash = createHash('sha256').update(normalizedPrompt).digest('hex').slice(0, 16);
+        const recallKey = `${bankId}::${queryHash}`;
         const existing = inflightRecalls.get(recallKey);
         let recallPromise: Promise<RecallResponse>;
         if (existing) {
-          console.log(`[Hindsight] Reusing in-flight recall for bank ${bankId}`);
+          debug(`[Hindsight] Reusing in-flight recall for bank ${bankId}`);
           recallPromise = existing;
         } else {
-          recallPromise = client.recall({ query: prompt, max_tokens: 2048 }, RECALL_TIMEOUT_MS);
+          recallPromise = client.recall({ query: prompt, max_tokens: pluginConfig.recallMaxTokens || 1024, budget: pluginConfig.recallBudget, types: pluginConfig.recallTypes }, RECALL_TIMEOUT_MS);
           inflightRecalls.set(recallKey, recallPromise);
           void recallPromise.catch(() => {}).finally(() => inflightRecalls.delete(recallKey));
         }
@@ -789,21 +1121,27 @@ export default function (api: MoltbotPluginAPI) {
         const response = await recallPromise;
 
         if (!response.results || response.results.length === 0) {
-          console.log('[Hindsight] No memories found for auto-recall');
+          debug('[Hindsight] No memories found for auto-recall');
           return;
         }
 
+        debug(`[Hindsight] Raw recall response (${response.results.length} results before topK):\n${response.results.map((r: any, i: number) => `  [${i}] score=${r.score?.toFixed(3) ?? 'n/a'} type=${r.type ?? 'n/a'}: ${JSON.stringify(r.content ?? r.text ?? r).substring(0, 200)}`).join('\n')}`);
+
+        const results = pluginConfig.recallTopK ? response.results.slice(0, pluginConfig.recallTopK) : response.results;
+
+        debug(`[Hindsight] After topK (${pluginConfig.recallTopK ?? 'unlimited'}): ${results.length} results injected`);
+
         // Format memories as JSON with all fields from recall
-        const memoriesJson = JSON.stringify(response.results, null, 2);
+        const memoriesFormatted = formatMemories(results);
 
         const contextMessage = `<hindsight_memories>
-Relevant memories from past conversations (prioritize recent when conflicting):
-${memoriesJson}
+${pluginConfig.recallPromptPreamble || DEFAULT_RECALL_PROMPT_PREAMBLE}
+Current time - ${formatCurrentTimeForRecall()}
 
-User message: ${prompt}
+${memoriesFormatted}
 </hindsight_memories>`;
 
-        console.log(`[Hindsight] Auto-recall: Injecting ${response.results.length} memories from bank ${bankId}`);
+        debug(`[Hindsight] Auto-recall: Injecting ${results.length} memories from bank ${bankId}`);
 
         // Inject context before the user message
         return { prependContext: contextMessage };
@@ -822,24 +1160,81 @@ User message: ${prompt}
     // Hook signature: (event, ctx) where event has {messages, success, error?, durationMs?}
     api.on('agent_end', async (event: any, ctx?: PluginHookAgentContext) => {
       try {
-        // Use context from this hook, or fall back to context captured in before_agent_start
-        const effectiveCtx = ctx || currentAgentContext;
+        // Avoid cross-session contamination: only use context carried by this event.
+        const eventSessionKey = typeof event?.sessionKey === 'string' ? event.sessionKey : undefined;
+        const effectiveCtx = ctx || (eventSessionKey ? ({ sessionKey: eventSessionKey } as PluginHookAgentContext) : undefined);
 
         // Check if this provider is excluded
         if (effectiveCtx?.messageProvider && pluginConfig.excludeProviders?.includes(effectiveCtx.messageProvider)) {
-          console.log(`[Hindsight] Skipping retain for excluded provider: ${effectiveCtx.messageProvider}`);
+          debug(`[Hindsight] Skipping retain for excluded provider: ${effectiveCtx.messageProvider}`);
           return;
         }
 
-        // Derive bank ID from context
-        const bankId = deriveBankId(effectiveCtx, pluginConfig);
-        console.log(`[Hindsight Hook] agent_end triggered - bank: ${bankId}`);
+        // Derive bank ID from context — enrich ctx.senderId from the session cache.
+        // event.messages in agent_end is clean history without OpenClaw's metadata blocks;
+        // the sender ID was captured during before_prompt_build where event.prompt has them.
+        const sessionKeyForLookup = effectiveCtx?.sessionKey;
+        const senderIdFromCache = !effectiveCtx?.senderId && sessionKeyForLookup
+          ? senderIdBySession.get(sessionKeyForLookup)
+          : undefined;
+        const effectiveCtxForRetain = senderIdFromCache ? { ...effectiveCtx, senderId: senderIdFromCache } : effectiveCtx;
+        const bankId = deriveBankId(effectiveCtxForRetain, pluginConfig);
+        debug(`[Hindsight Hook] agent_end triggered - bank: ${bankId}`);
 
-        // Check event success and messages
-        if (!event.success || !Array.isArray(event.messages) || event.messages.length === 0) {
-          console.log('[Hindsight Hook] Skipping: success:', event.success, 'messages:', event.messages?.length);
+        if (event.success === false) {
+          debug('[Hindsight Hook] Agent run failed, skipping retention');
           return;
         }
+
+        if (!Array.isArray(event.context?.sessionEntry?.messages ?? event.messages) || (event.context?.sessionEntry?.messages ?? event.messages ?? []).length === 0) {
+          debug('[Hindsight Hook] No messages in event, skipping retention');
+          return;
+        }
+
+        if (pluginConfig.autoRetain === false) {
+          debug('[Hindsight Hook] autoRetain is disabled, skipping retention');
+          return;
+        }
+
+        // Chunked retention: skip non-Nth turns and use a sliding window when firing
+        const retainEveryN = pluginConfig.retainEveryNTurns ?? 1;
+        const allMessages = event.context?.sessionEntry?.messages ?? event.messages ?? [];
+        let messagesToRetain = allMessages;
+        let retainFullWindow = false;
+
+        if (retainEveryN > 1) {
+          const sessionTrackingKey = `${bankId}:${effectiveCtx?.sessionKey || 'session'}`;
+          const turnCount = (turnCountBySession.get(sessionTrackingKey) || 0) + 1;
+          turnCountBySession.set(sessionTrackingKey, turnCount);
+          if (turnCountBySession.size > MAX_TRACKED_SESSIONS) {
+            const oldestKey = turnCountBySession.keys().next().value;
+            if (oldestKey) {
+              turnCountBySession.delete(oldestKey);
+            }
+          }
+
+          if (turnCount % retainEveryN !== 0) {
+            const nextRetainAt = Math.ceil(turnCount / retainEveryN) * retainEveryN;
+            debug(`[Hindsight Hook] Turn ${turnCount}/${retainEveryN}, skipping retain (next at turn ${nextRetainAt})`);
+            return;
+          }
+
+          // Sliding window in turns: N turns + configured overlap turns.
+          // We slice by actual turn boundaries (user-role messages), so this
+          // remains stable even when system/tool messages are present.
+          const overlapTurns = pluginConfig.retainOverlapTurns ?? 0;
+          const windowTurns = retainEveryN + overlapTurns;
+          messagesToRetain = sliceLastTurnsByUserBoundary(allMessages, windowTurns);
+          retainFullWindow = true;
+          debug(`[Hindsight Hook] Turn ${turnCount}: chunked retain firing (window: ${windowTurns} turns, ${messagesToRetain.length} messages)`);
+        }
+
+        const retention = prepareRetentionTranscript(messagesToRetain, pluginConfig, retainFullWindow);
+        if (!retention) {
+          debug('[Hindsight Hook] No messages to retain (filtered/short/no-user)');
+          return;
+        }
+        const { transcript, messageCount } = retention;
 
         // Wait for client to be ready
         const clientGlobal = (global as any).__hindsightClient;
@@ -851,63 +1246,37 @@ User message: ${prompt}
         await clientGlobal.waitForReady();
 
         // Get client configured for this context's bank (async to handle mission setup)
-        const client = await clientGlobal.getClientForContext(effectiveCtx);
+        const client = await clientGlobal.getClientForContext(effectiveCtxForRetain);
         if (!client) {
           console.warn('[Hindsight] Client not initialized, skipping retain');
           return;
         }
 
-        // Format messages into a transcript
-        const transcript = event.messages
-          .map((msg: any) => {
-            const role = msg.role || 'unknown';
-            let content = '';
-
-            // Handle different content formats
-            if (typeof msg.content === 'string') {
-              content = msg.content;
-            } else if (Array.isArray(msg.content)) {
-              content = msg.content
-                .filter((block: any) => block.type === 'text')
-                .map((block: any) => block.text)
-                .join('\n');
-            }
-
-            // Strip plugin-injected memory tags to prevent feedback loop
-            content = stripMemoryTags(content);
-
-            return `[role: ${role}]\n${content}\n[${role}:end]`;
-          })
-          .join('\n\n');
-
-        if (!transcript.trim() || transcript.length < 10) {
-          console.log('[Hindsight Hook] Transcript too short, skipping');
-          return;
-        }
 
         // Use unique document ID per conversation (sessionKey + timestamp)
         // Static sessionKey (e.g. "agent:main:main") causes CASCADE delete of old memories
-        const documentId = `${effectiveCtx?.sessionKey || currentSessionKey || 'session'}-${Date.now()}`;
+        const documentId = `${effectiveCtx?.sessionKey || 'session'}-${Date.now()}`;
 
         // Retain to Hindsight
+        debug(`[Hindsight] Retaining to bank ${bankId}, document: ${documentId}, chars: ${transcript.length}\n---\n${transcript.substring(0, 500)}${transcript.length > 500 ? '\n...(truncated)' : ''}\n---`);
         await client.retain({
           content: transcript,
           document_id: documentId,
           metadata: {
             retained_at: new Date().toISOString(),
-            message_count: String(event.messages.length),
+            message_count: String(messageCount),
             channel_type: effectiveCtx?.messageProvider,
             channel_id: effectiveCtx?.channelId,
             sender_id: effectiveCtx?.senderId,
           },
         });
 
-        console.log(`[Hindsight] Retained ${event.messages.length} messages to bank ${bankId} for session ${documentId}`);
+        debug(`[Hindsight] Retained ${messageCount} messages to bank ${bankId} for session ${documentId}`);
       } catch (error) {
         console.error('[Hindsight] Error retaining messages:', error);
       }
     });
-    console.log('[Hindsight] Hooks registered');
+    debug('[Hindsight] Hooks registered');
   } catch (error) {
     console.error('[Hindsight] Plugin loading error:', error);
     if (error instanceof Error) {
@@ -918,6 +1287,102 @@ User message: ${prompt}
 }
 
 // Export client getter for tools
+
+export function prepareRetentionTranscript(
+  messages: any[],
+  pluginConfig: PluginConfig,
+  retainFullWindow = false
+): { transcript: string; messageCount: number } | null {
+  if (!messages || messages.length === 0) {
+    return null;
+  }
+
+  let targetMessages: any[];
+  if (retainFullWindow) {
+    // Chunked retention: retain the full sliding window (already sliced by caller)
+    targetMessages = messages;
+  } else {
+    // Default: retain only the last turn (user message + assistant responses)
+    let lastUserIdx = -1;
+    for (let i = messages.length - 1; i >= 0; i--) {
+      if (messages[i].role === 'user') {
+        lastUserIdx = i;
+        break;
+      }
+    }
+    if (lastUserIdx === -1) {
+      return null; // No user message found in turn
+    }
+    targetMessages = messages.slice(lastUserIdx);
+  }
+
+  // Role filtering
+  const allowedRoles = new Set(pluginConfig.retainRoles || ['user', 'assistant']);
+  const filteredMessages = targetMessages.filter((m: any) => allowedRoles.has(m.role));
+
+  if (filteredMessages.length === 0) {
+    return null; // No messages to retain
+  }
+
+  // Format messages into a transcript
+  const transcriptParts = filteredMessages
+    .map((msg: any) => {
+      const role = msg.role || 'unknown';
+      let content = '';
+
+      // Handle different content formats
+      if (typeof msg.content === 'string') {
+        content = msg.content;
+      } else if (Array.isArray(msg.content)) {
+        content = msg.content
+          .filter((block: any) => block.type === 'text')
+          .map((block: any) => block.text)
+          .join('\n');
+      }
+
+      // Strip plugin-injected memory tags and metadata envelopes to prevent feedback loop
+      content = stripMemoryTags(content);
+      content = stripMetadataEnvelopes(content);
+
+      return content.trim() ? `[role: ${role}]\n${content}\n[${role}:end]` : null;
+    })
+    .filter(Boolean);
+
+  const transcript = transcriptParts.join('\n\n');
+
+  if (!transcript.trim() || transcript.length < 10) {
+    return null; // Transcript too short
+  }
+
+  return { transcript, messageCount: transcriptParts.length };
+}
+
+export function sliceLastTurnsByUserBoundary(messages: any[], turns: number): any[] {
+  if (!Array.isArray(messages) || messages.length === 0 || turns <= 0) {
+    return [];
+  }
+
+  let userTurnsSeen = 0;
+  let startIndex = -1;
+
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (messages[i]?.role === 'user') {
+      userTurnsSeen += 1;
+      if (userTurnsSeen >= turns) {
+        startIndex = i;
+        break;
+      }
+    }
+  }
+
+  if (startIndex === -1) {
+    return messages;
+  }
+
+  return messages.slice(startIndex);
+}
+
+
 export function getClient() {
   return client;
 }

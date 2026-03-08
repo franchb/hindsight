@@ -5,6 +5,40 @@
 
 import { toast } from "sonner";
 
+export interface WebhookHttpConfig {
+  method: string;
+  timeout_seconds: number;
+  headers: Record<string, string>;
+  params: Record<string, string>;
+}
+
+export interface Webhook {
+  id: string;
+  bank_id: string | null;
+  url: string;
+  event_types: string[];
+  enabled: boolean;
+  http_config: WebhookHttpConfig;
+  created_at: string | null;
+  updated_at: string | null;
+}
+
+export interface WebhookDelivery {
+  id: string;
+  webhook_id: string | null;
+  url: string;
+  event_type: string;
+  status: string;
+  attempts: number;
+  next_retry_at: string | null;
+  last_error: string | null;
+  last_response_status: number | null;
+  last_response_body: string | null;
+  last_attempt_at: string | null;
+  created_at: string | null;
+  updated_at: string | null;
+}
+
 export interface MentalModel {
   id: string;
   bank_id: string;
@@ -165,15 +199,17 @@ export class ControlPlaneClient {
       content: string;
       timestamp?: string;
       context?: string;
-      metadata?: Record<string, string>;
       document_id?: string;
+      metadata?: Record<string, string>;
       entities?: Array<{ text: string; type?: string }>;
+      tags?: string[];
+      observation_scopes?: "per_tag" | "combined" | "all_combinations" | string[][];
     }>;
     document_id?: string;
     async?: boolean;
   }) {
     const endpoint = params.async ? "/api/memories/retain_async" : "/api/memories/retain";
-    return this.fetchApi(endpoint, {
+    return this.fetchApi<{ message?: string }>(endpoint, {
       method: "POST",
       body: JSON.stringify(params),
     });
@@ -301,6 +337,20 @@ export class ControlPlaneClient {
   }
 
   /**
+   * Update tags on a document and its associated memory units
+   */
+  async updateDocument(documentId: string, bankId: string, tags: string[]) {
+    return this.fetchApi<{ success: boolean }>(
+      `/api/documents/${encodeURIComponent(documentId)}?bank_id=${bankId}`,
+      {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ tags }),
+      }
+    );
+  }
+
+  /**
    * Delete document and all its associated memory units
    */
   async deleteDocument(documentId: string, bankId: string) {
@@ -376,7 +426,41 @@ export class ControlPlaneClient {
       document_id: string | null;
       chunk_id: string | null;
       tags: string[];
+      observation_scopes: string | string[][] | null;
+      history?: {
+        previous_text: string;
+        previous_tags: string[];
+        previous_occurred_start: string | null;
+        previous_occurred_end: string | null;
+        previous_mentioned_at: string | null;
+        changed_at: string;
+        new_source_memory_ids: string[];
+      }[];
     }>(`/api/memories/${memoryId}?bank_id=${bankId}`);
+  }
+
+  /**
+   * Get the history of an observation with resolved source facts
+   */
+  async getObservationHistory(memoryId: string, bankId: string) {
+    return this.fetchApi<
+      {
+        previous_text: string;
+        previous_tags: string[];
+        previous_occurred_start: string | null;
+        previous_occurred_end: string | null;
+        previous_mentioned_at: string | null;
+        changed_at: string;
+        new_source_memory_ids: string[];
+        source_facts: {
+          id: string;
+          text: string | null;
+          type: string | null;
+          context: string | null;
+          is_new: boolean;
+        }[];
+      }[]
+    >(`/api/memories/${memoryId}/history?bank_id=${bankId}`);
   }
 
   /**
@@ -744,6 +828,18 @@ export class ControlPlaneClient {
   }
 
   /**
+   * Get the refresh history of a mental model
+   */
+  async getMentalModelHistory(bankId: string, mentalModelId: string) {
+    return this.fetchApi<
+      {
+        previous_content: string | null;
+        changed_at: string;
+      }[]
+    >(`/api/banks/${bankId}/mental-models/${mentalModelId}/history`);
+  }
+
+  /**
    * Get API version and feature flags
    * Use this to check which capabilities are available in the dataplane
    */
@@ -854,6 +950,79 @@ export class ControlPlaneClient {
     }>(`/api/banks/${bankId}/config`, {
       method: "DELETE",
     });
+  }
+
+  /**
+   * List webhooks for a bank
+   */
+  async listWebhooks(bankId: string): Promise<{ items: Webhook[] }> {
+    return this.fetchApi<{ items: Webhook[] }>(`/api/banks/${bankId}/webhooks`);
+  }
+
+  /**
+   * Create a webhook
+   */
+  async createWebhook(
+    bankId: string,
+    params: {
+      url: string;
+      secret?: string;
+      event_types?: string[];
+      enabled?: boolean;
+      http_config?: WebhookHttpConfig;
+    }
+  ): Promise<Webhook> {
+    return this.fetchApi<Webhook>(`/api/banks/${bankId}/webhooks`, {
+      method: "POST",
+      body: JSON.stringify(params),
+    });
+  }
+
+  /**
+   * Update a webhook (PATCH — only provided fields are changed)
+   */
+  async updateWebhook(
+    bankId: string,
+    webhookId: string,
+    params: {
+      url?: string;
+      secret?: string | null;
+      event_types?: string[];
+      enabled?: boolean;
+      http_config?: WebhookHttpConfig;
+    }
+  ): Promise<Webhook> {
+    return this.fetchApi<Webhook>(`/api/banks/${bankId}/webhooks/${webhookId}`, {
+      method: "PATCH",
+      body: JSON.stringify(params),
+    });
+  }
+
+  /**
+   * Delete a webhook
+   */
+  async deleteWebhook(bankId: string, webhookId: string): Promise<{ success: boolean }> {
+    return this.fetchApi<{ success: boolean }>(`/api/banks/${bankId}/webhooks/${webhookId}`, {
+      method: "DELETE",
+    });
+  }
+
+  /**
+   * List webhook deliveries
+   */
+  async listWebhookDeliveries(
+    bankId: string,
+    webhookId: string,
+    limit?: number,
+    cursor?: string
+  ): Promise<{ items: WebhookDelivery[]; next_cursor: string | null }> {
+    const params = new URLSearchParams();
+    if (limit) params.append("limit", limit.toString());
+    if (cursor) params.append("cursor", cursor);
+    const query = params.toString();
+    return this.fetchApi<{ items: WebhookDelivery[]; next_cursor: string | null }>(
+      `/api/banks/${bankId}/webhooks/${webhookId}/deliveries${query ? `?${query}` : ""}`
+    );
   }
 }
 

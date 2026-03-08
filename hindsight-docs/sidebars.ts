@@ -99,6 +99,11 @@ const sidebars: SidebarsConfig = {
           id: 'developer/api/operations',
           label: 'Operations',
         },
+        {
+          type: 'doc',
+          id: 'developer/api/webhooks',
+          label: 'Webhooks',
+        },
       ],
     },
     {
@@ -212,6 +217,14 @@ const sidebars: SidebarsConfig = {
         },
         {
           type: 'doc',
+          id: 'sdks/integrations/chat',
+          label: 'Vercel Chat SDK',
+          customProps: {
+            icon: "/img/icons/vercel.png"
+          }
+        },
+        {
+          type: 'doc',
           id: 'sdks/integrations/crewai',
           label: 'CrewAI',
           customProps: {
@@ -220,17 +233,18 @@ const sidebars: SidebarsConfig = {
         },
         {
           type: 'doc',
+          id: 'sdks/integrations/pydantic-ai',
+          label: 'Pydantic AI',
+          customProps: {
+            icon: "/img/icons/pydanticai.png"
+          }
+        },
+        {
+          type: 'doc',
           id: 'sdks/integrations/skills',
           label: 'Skills',
         },
       ],
-    },
-  ],
-  cookbookSidebar: [
-    {
-      type: 'doc',
-      id: 'cookbook/index',
-      label: 'Cookbook',
     },
   ],
 };

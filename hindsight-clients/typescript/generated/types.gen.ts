@@ -619,6 +619,42 @@ export type CreateMentalModelResponse = {
 };
 
 /**
+ * CreateWebhookRequest
+ *
+ * Request model for registering a webhook.
+ */
+export type CreateWebhookRequest = {
+  /**
+   * Url
+   *
+   * HTTP(S) endpoint URL to deliver events to
+   */
+  url: string;
+  /**
+   * Secret
+   *
+   * HMAC-SHA256 signing secret (optional)
+   */
+  secret?: string | null;
+  /**
+   * Event Types
+   *
+   * List of event types to deliver. Currently supported: 'consolidation.completed'
+   */
+  event_types?: Array<string>;
+  /**
+   * Enabled
+   *
+   * Whether this webhook is active
+   */
+  enabled?: boolean;
+  /**
+   * HTTP delivery configuration (method, timeout, headers, params)
+   */
+  http_config?: WebhookHttpConfig;
+};
+
+/**
  * DeleteDocumentResponse
  *
  * Response model for delete document endpoint.
@@ -1165,6 +1201,8 @@ export type MemoryItem = {
   content: string;
   /**
    * Timestamp
+   *
+   * When the content occurred. Accepts an ISO 8601 datetime string (e.g. '2024-01-15T10:30:00Z'), null/omitted (defaults to now), or the special string 'unset' to explicitly store without any timestamp (use this for timeless content such as fictional documents or static reference material).
    */
   timestamp?: string | null;
   /**
@@ -1195,6 +1233,17 @@ export type MemoryItem = {
    * Optional tags for visibility scoping. Memories with tags can be filtered during recall.
    */
   tags?: Array<string> | null;
+  /**
+   * ObservationScopes
+   *
+   * How to scope observations during consolidation. 'per_tag' runs one consolidation pass per individual tag, creating separate observations for each tag. 'combined' (default) runs a single pass with all tags together. A list of tag lists runs one pass per inner list, giving full control over which combinations to use.
+   */
+  observation_scopes?:
+    | "per_tag"
+    | "combined"
+    | "all_combinations"
+    | Array<Array<string>>
+    | null;
 };
 
 /**
@@ -1911,9 +1960,15 @@ export type SourceFactsIncludeOptions = {
   /**
    * Max Tokens
    *
-   * Maximum tokens for source facts
+   * Maximum total tokens for source facts across all observations (-1 = unlimited)
    */
   max_tokens?: number;
+  /**
+   * Max Tokens Per Observation
+   *
+   * Maximum tokens of source facts per observation (-1 = unlimited)
+   */
+  max_tokens_per_observation?: number;
 };
 
 /**
@@ -2027,6 +2082,32 @@ export type UpdateDispositionRequest = {
 };
 
 /**
+ * UpdateDocumentRequest
+ *
+ * Request model for updating a document's mutable fields.
+ */
+export type UpdateDocumentRequest = {
+  /**
+   * Tags
+   *
+   * New tags for the document and its memory units. Triggers observation invalidation and re-consolidation.
+   */
+  tags?: Array<string> | null;
+};
+
+/**
+ * UpdateDocumentResponse
+ *
+ * Response model for update document endpoint.
+ */
+export type UpdateDocumentResponse = {
+  /**
+   * Success
+   */
+  success?: boolean;
+};
+
+/**
  * UpdateMentalModelRequest
  *
  * Request model for updating a mental model.
@@ -2063,6 +2144,42 @@ export type UpdateMentalModelRequest = {
 };
 
 /**
+ * UpdateWebhookRequest
+ *
+ * Request model for updating a webhook. Only provided fields are updated.
+ */
+export type UpdateWebhookRequest = {
+  /**
+   * Url
+   *
+   * HTTP(S) endpoint URL
+   */
+  url?: string | null;
+  /**
+   * Secret
+   *
+   * HMAC-SHA256 signing secret. Omit to keep existing; send null to clear.
+   */
+  secret?: string | null;
+  /**
+   * Event Types
+   *
+   * List of event types
+   */
+  event_types?: Array<string> | null;
+  /**
+   * Enabled
+   *
+   * Whether this webhook is active
+   */
+  enabled?: boolean | null;
+  /**
+   * HTTP delivery configuration
+   */
+  http_config?: WebhookHttpConfig | null;
+};
+
+/**
  * ValidationError
  */
 export type ValidationError = {
@@ -2096,6 +2213,173 @@ export type VersionResponse = {
    * Enabled feature flags
    */
   features: FeaturesInfo;
+};
+
+/**
+ * WebhookDeliveryListResponse
+ *
+ * Response model for listing webhook deliveries.
+ */
+export type WebhookDeliveryListResponse = {
+  /**
+   * Items
+   */
+  items: Array<WebhookDeliveryResponse>;
+  /**
+   * Next Cursor
+   */
+  next_cursor?: string | null;
+};
+
+/**
+ * WebhookDeliveryResponse
+ *
+ * Response model for a webhook delivery record.
+ */
+export type WebhookDeliveryResponse = {
+  /**
+   * Id
+   */
+  id: string;
+  /**
+   * Webhook Id
+   */
+  webhook_id: string | null;
+  /**
+   * Url
+   */
+  url: string;
+  /**
+   * Event Type
+   */
+  event_type: string;
+  /**
+   * Status
+   */
+  status: string;
+  /**
+   * Attempts
+   */
+  attempts: number;
+  /**
+   * Next Retry At
+   */
+  next_retry_at?: string | null;
+  /**
+   * Last Error
+   */
+  last_error?: string | null;
+  /**
+   * Last Response Status
+   */
+  last_response_status?: number | null;
+  /**
+   * Last Response Body
+   */
+  last_response_body?: string | null;
+  /**
+   * Last Attempt At
+   */
+  last_attempt_at?: string | null;
+  /**
+   * Created At
+   */
+  created_at?: string | null;
+  /**
+   * Updated At
+   */
+  updated_at?: string | null;
+};
+
+/**
+ * WebhookHttpConfig
+ *
+ * HTTP delivery configuration for a webhook.
+ */
+export type WebhookHttpConfig = {
+  /**
+   * Method
+   *
+   * HTTP method: GET or POST
+   */
+  method?: string;
+  /**
+   * Timeout Seconds
+   *
+   * HTTP request timeout in seconds
+   */
+  timeout_seconds?: number;
+  /**
+   * Headers
+   *
+   * Custom HTTP headers
+   */
+  headers?: {
+    [key: string]: string;
+  };
+  /**
+   * Params
+   *
+   * Custom HTTP query parameters
+   */
+  params?: {
+    [key: string]: string;
+  };
+};
+
+/**
+ * WebhookListResponse
+ *
+ * Response model for listing webhooks.
+ */
+export type WebhookListResponse = {
+  /**
+   * Items
+   */
+  items: Array<WebhookResponse>;
+};
+
+/**
+ * WebhookResponse
+ *
+ * Response model for a webhook.
+ */
+export type WebhookResponse = {
+  /**
+   * Id
+   */
+  id: string;
+  /**
+   * Bank Id
+   */
+  bank_id: string | null;
+  /**
+   * Url
+   */
+  url: string;
+  /**
+   * Secret
+   *
+   * Signing secret (redacted in responses)
+   */
+  secret?: string | null;
+  /**
+   * Event Types
+   */
+  event_types: Array<string>;
+  /**
+   * Enabled
+   */
+  enabled: boolean;
+  http_config?: WebhookHttpConfig;
+  /**
+   * Created At
+   */
+  created_at?: string | null;
+  /**
+   * Updated At
+   */
+  updated_at?: string | null;
 };
 
 export type HealthEndpointHealthGetData = {
@@ -2285,6 +2569,45 @@ export type GetMemoryErrors = {
 export type GetMemoryError = GetMemoryErrors[keyof GetMemoryErrors];
 
 export type GetMemoryResponses = {
+  /**
+   * Successful Response
+   */
+  200: unknown;
+};
+
+export type GetObservationHistoryData = {
+  body?: never;
+  headers?: {
+    /**
+     * Authorization
+     */
+    authorization?: string | null;
+  };
+  path: {
+    /**
+     * Bank Id
+     */
+    bank_id: string;
+    /**
+     * Memory Id
+     */
+    memory_id: string;
+  };
+  query?: never;
+  url: "/v1/default/banks/{bank_id}/memories/{memory_id}/history";
+};
+
+export type GetObservationHistoryErrors = {
+  /**
+   * Validation Error
+   */
+  422: HttpValidationError;
+};
+
+export type GetObservationHistoryError =
+  GetObservationHistoryErrors[keyof GetObservationHistoryErrors];
+
+export type GetObservationHistoryResponses = {
   /**
    * Successful Response
    */
@@ -2785,6 +3108,45 @@ export type UpdateMentalModelResponses = {
 export type UpdateMentalModelResponse =
   UpdateMentalModelResponses[keyof UpdateMentalModelResponses];
 
+export type GetMentalModelHistoryData = {
+  body?: never;
+  headers?: {
+    /**
+     * Authorization
+     */
+    authorization?: string | null;
+  };
+  path: {
+    /**
+     * Bank Id
+     */
+    bank_id: string;
+    /**
+     * Mental Model Id
+     */
+    mental_model_id: string;
+  };
+  query?: never;
+  url: "/v1/default/banks/{bank_id}/mental-models/{mental_model_id}/history";
+};
+
+export type GetMentalModelHistoryErrors = {
+  /**
+   * Validation Error
+   */
+  422: HttpValidationError;
+};
+
+export type GetMentalModelHistoryError =
+  GetMentalModelHistoryErrors[keyof GetMentalModelHistoryErrors];
+
+export type GetMentalModelHistoryResponses = {
+  /**
+   * Successful Response
+   */
+  200: unknown;
+};
+
 export type RefreshMentalModelData = {
   body?: never;
   headers?: {
@@ -3069,8 +3431,22 @@ export type ListDocumentsData = {
   query?: {
     /**
      * Q
+     *
+     * Case-insensitive substring filter on document ID (e.g. 'report' matches 'report-2024')
      */
     q?: string | null;
+    /**
+     * Tags
+     *
+     * Filter documents by tags
+     */
+    tags?: Array<string> | null;
+    /**
+     * Tags Match
+     *
+     * How to match tags: 'any', 'all', 'any_strict', 'all_strict'
+     */
+    tags_match?: string;
     /**
      * Limit
      */
@@ -3184,6 +3560,48 @@ export type GetDocumentResponses = {
 
 export type GetDocumentResponse =
   GetDocumentResponses[keyof GetDocumentResponses];
+
+export type UpdateDocumentData = {
+  body: UpdateDocumentRequest;
+  headers?: {
+    /**
+     * Authorization
+     */
+    authorization?: string | null;
+  };
+  path: {
+    /**
+     * Bank Id
+     */
+    bank_id: string;
+    /**
+     * Document Id
+     */
+    document_id: string;
+  };
+  query?: never;
+  url: "/v1/default/banks/{bank_id}/documents/{document_id}";
+};
+
+export type UpdateDocumentErrors = {
+  /**
+   * Validation Error
+   */
+  422: HttpValidationError;
+};
+
+export type UpdateDocumentError =
+  UpdateDocumentErrors[keyof UpdateDocumentErrors];
+
+export type UpdateDocumentResponses = {
+  /**
+   * Successful Response
+   */
+  200: UpdateDocumentResponse;
+};
+
+export type UpdateDocumentResponse2 =
+  UpdateDocumentResponses[keyof UpdateDocumentResponses];
 
 export type ListTagsData = {
   body?: never;
@@ -3871,6 +4289,217 @@ export type TriggerConsolidationResponses = {
 
 export type TriggerConsolidationResponse =
   TriggerConsolidationResponses[keyof TriggerConsolidationResponses];
+
+export type ListWebhooksData = {
+  body?: never;
+  headers?: {
+    /**
+     * Authorization
+     */
+    authorization?: string | null;
+  };
+  path: {
+    /**
+     * Bank Id
+     */
+    bank_id: string;
+  };
+  query?: never;
+  url: "/v1/default/banks/{bank_id}/webhooks";
+};
+
+export type ListWebhooksErrors = {
+  /**
+   * Validation Error
+   */
+  422: HttpValidationError;
+};
+
+export type ListWebhooksError = ListWebhooksErrors[keyof ListWebhooksErrors];
+
+export type ListWebhooksResponses = {
+  /**
+   * Successful Response
+   */
+  200: WebhookListResponse;
+};
+
+export type ListWebhooksResponse =
+  ListWebhooksResponses[keyof ListWebhooksResponses];
+
+export type CreateWebhookData = {
+  body: CreateWebhookRequest;
+  headers?: {
+    /**
+     * Authorization
+     */
+    authorization?: string | null;
+  };
+  path: {
+    /**
+     * Bank Id
+     */
+    bank_id: string;
+  };
+  query?: never;
+  url: "/v1/default/banks/{bank_id}/webhooks";
+};
+
+export type CreateWebhookErrors = {
+  /**
+   * Validation Error
+   */
+  422: HttpValidationError;
+};
+
+export type CreateWebhookError = CreateWebhookErrors[keyof CreateWebhookErrors];
+
+export type CreateWebhookResponses = {
+  /**
+   * Successful Response
+   */
+  201: WebhookResponse;
+};
+
+export type CreateWebhookResponse =
+  CreateWebhookResponses[keyof CreateWebhookResponses];
+
+export type DeleteWebhookData = {
+  body?: never;
+  headers?: {
+    /**
+     * Authorization
+     */
+    authorization?: string | null;
+  };
+  path: {
+    /**
+     * Bank Id
+     */
+    bank_id: string;
+    /**
+     * Webhook Id
+     */
+    webhook_id: string;
+  };
+  query?: never;
+  url: "/v1/default/banks/{bank_id}/webhooks/{webhook_id}";
+};
+
+export type DeleteWebhookErrors = {
+  /**
+   * Validation Error
+   */
+  422: HttpValidationError;
+};
+
+export type DeleteWebhookError = DeleteWebhookErrors[keyof DeleteWebhookErrors];
+
+export type DeleteWebhookResponses = {
+  /**
+   * Successful Response
+   */
+  200: DeleteResponse;
+};
+
+export type DeleteWebhookResponse =
+  DeleteWebhookResponses[keyof DeleteWebhookResponses];
+
+export type UpdateWebhookData = {
+  body: UpdateWebhookRequest;
+  headers?: {
+    /**
+     * Authorization
+     */
+    authorization?: string | null;
+  };
+  path: {
+    /**
+     * Bank Id
+     */
+    bank_id: string;
+    /**
+     * Webhook Id
+     */
+    webhook_id: string;
+  };
+  query?: never;
+  url: "/v1/default/banks/{bank_id}/webhooks/{webhook_id}";
+};
+
+export type UpdateWebhookErrors = {
+  /**
+   * Validation Error
+   */
+  422: HttpValidationError;
+};
+
+export type UpdateWebhookError = UpdateWebhookErrors[keyof UpdateWebhookErrors];
+
+export type UpdateWebhookResponses = {
+  /**
+   * Successful Response
+   */
+  200: WebhookResponse;
+};
+
+export type UpdateWebhookResponse =
+  UpdateWebhookResponses[keyof UpdateWebhookResponses];
+
+export type ListWebhookDeliveriesData = {
+  body?: never;
+  headers?: {
+    /**
+     * Authorization
+     */
+    authorization?: string | null;
+  };
+  path: {
+    /**
+     * Bank Id
+     */
+    bank_id: string;
+    /**
+     * Webhook Id
+     */
+    webhook_id: string;
+  };
+  query?: {
+    /**
+     * Limit
+     *
+     * Maximum number of deliveries to return
+     */
+    limit?: number;
+    /**
+     * Cursor
+     *
+     * Pagination cursor (created_at of last item)
+     */
+    cursor?: string | null;
+  };
+  url: "/v1/default/banks/{bank_id}/webhooks/{webhook_id}/deliveries";
+};
+
+export type ListWebhookDeliveriesErrors = {
+  /**
+   * Validation Error
+   */
+  422: HttpValidationError;
+};
+
+export type ListWebhookDeliveriesError =
+  ListWebhookDeliveriesErrors[keyof ListWebhookDeliveriesErrors];
+
+export type ListWebhookDeliveriesResponses = {
+  /**
+   * Successful Response
+   */
+  200: WebhookDeliveryListResponse;
+};
+
+export type ListWebhookDeliveriesResponse =
+  ListWebhookDeliveriesResponses[keyof ListWebhookDeliveriesResponses];
 
 export type ClearBankMemoriesData = {
   body?: never;

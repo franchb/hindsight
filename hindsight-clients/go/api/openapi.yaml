@@ -7,7 +7,7 @@ info:
     name: Apache 2.0
     url: https://www.apache.org/licenses/LICENSE-2.0.html
   title: Hindsight HTTP API
-  version: 0.4.13
+  version: 0.4.16
 servers:
 - url: /
 paths:
@@ -210,8 +210,9 @@ paths:
       - Memory
   /v1/default/banks/{bank_id}/memories/{memory_id}:
     get:
-      description: Get a single memory unit by ID with all its metadata including
-        entities and tags.
+      description: "Get a single memory unit by ID with all its metadata including\
+        \ entities and tags. Note: the 'history' field is deprecated and always returns\
+        \ an empty list - use GET /memories/{memory_id}/history instead."
       operationId: get_memory
       parameters:
       - explode: false
@@ -251,6 +252,51 @@ paths:
                 $ref: '#/components/schemas/HTTPValidationError'
           description: Validation Error
       summary: Get memory unit
+      tags:
+      - Memory
+  /v1/default/banks/{bank_id}/memories/{memory_id}/history:
+    get:
+      description: "Get the full history of an observation, with each change's source\
+        \ facts resolved to their text."
+      operationId: get_observation_history
+      parameters:
+      - explode: false
+        in: path
+        name: bank_id
+        required: true
+        schema:
+          title: Bank Id
+          type: string
+        style: simple
+      - explode: false
+        in: path
+        name: memory_id
+        required: true
+        schema:
+          title: Memory Id
+          type: string
+        style: simple
+      - explode: false
+        in: header
+        name: authorization
+        required: false
+        schema:
+          nullable: true
+          type: string
+        style: simple
+      responses:
+        "200":
+          content:
+            application/json:
+              schema: {}
+          description: Successful Response
+        "422":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      summary: Get observation history
       tags:
       - Memory
   /v1/default/banks/{bank_id}/memories/recall:
@@ -838,6 +884,51 @@ paths:
       summary: Update mental model
       tags:
       - Mental Models
+  /v1/default/banks/{bank_id}/mental-models/{mental_model_id}/history:
+    get:
+      description: "Get the refresh history of a mental model, showing content changes\
+        \ over time."
+      operationId: get_mental_model_history
+      parameters:
+      - explode: false
+        in: path
+        name: bank_id
+        required: true
+        schema:
+          title: Bank Id
+          type: string
+        style: simple
+      - explode: false
+        in: path
+        name: mental_model_id
+        required: true
+        schema:
+          title: Mental Model Id
+          type: string
+        style: simple
+      - explode: false
+        in: header
+        name: authorization
+        required: false
+        schema:
+          nullable: true
+          type: string
+        style: simple
+      responses:
+        "200":
+          content:
+            application/json:
+              schema: {}
+          description: Successful Response
+        "422":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      summary: Get mental model history
+      tags:
+      - Mental Models
   /v1/default/banks/{bank_id}/mental-models/{mental_model_id}/refresh:
     post:
       description: Submit an async task to re-run the source query through reflect
@@ -1173,12 +1264,36 @@ paths:
           title: Bank Id
           type: string
         style: simple
-      - explode: true
+      - description: Case-insensitive substring filter on document ID (e.g. 'report'
+          matches 'report-2024')
+        explode: true
         in: query
         name: q
         required: false
         schema:
           nullable: true
+          type: string
+        style: form
+      - description: Filter documents by tags
+        explode: true
+        in: query
+        name: tags
+        required: false
+        schema:
+          items:
+            type: string
+          nullable: true
+          type: array
+        style: form
+      - description: "How to match tags: 'any', 'all', 'any_strict', 'all_strict'"
+        explode: true
+        in: query
+        name: tags_match
+        required: false
+        schema:
+          default: any_strict
+          description: "How to match tags: 'any', 'all', 'any_strict', 'all_strict'"
+          title: Tags Match
           type: string
         style: form
       - explode: true
@@ -1318,6 +1433,61 @@ paths:
                 $ref: '#/components/schemas/HTTPValidationError'
           description: Validation Error
       summary: Get document details
+      tags:
+      - Documents
+    patch:
+      description: |-
+        Update mutable fields on a document without re-processing its content.
+
+        **Tags** (`tags`): Propagated to all associated memory units. Observations derived from those units are invalidated and queued for re-consolidation under the new tags. Co-source memories from other documents that shared those observations are also reset.
+
+        At least one field must be provided.
+      operationId: update_document
+      parameters:
+      - explode: false
+        in: path
+        name: bank_id
+        required: true
+        schema:
+          title: Bank Id
+          type: string
+        style: simple
+      - explode: false
+        in: path
+        name: document_id
+        required: true
+        schema:
+          title: Document Id
+          type: string
+        style: simple
+      - explode: false
+        in: header
+        name: authorization
+        required: false
+        schema:
+          nullable: true
+          type: string
+        style: simple
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateDocumentRequest'
+        required: true
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UpdateDocumentResponse'
+          description: Successful Response
+        "422":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      summary: Update document
       tags:
       - Documents
   /v1/default/banks/{bank_id}/tags:
@@ -2087,6 +2257,248 @@ paths:
       summary: Trigger consolidation
       tags:
       - Banks
+  /v1/default/banks/{bank_id}/webhooks:
+    get:
+      description: List all webhooks registered for a bank.
+      operationId: list_webhooks
+      parameters:
+      - explode: false
+        in: path
+        name: bank_id
+        required: true
+        schema:
+          title: Bank Id
+          type: string
+        style: simple
+      - explode: false
+        in: header
+        name: authorization
+        required: false
+        schema:
+          nullable: true
+          type: string
+        style: simple
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WebhookListResponse'
+          description: Successful Response
+        "422":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      summary: List webhooks
+      tags:
+      - Webhooks
+    post:
+      description: Register a webhook endpoint to receive event notifications for
+        this bank.
+      operationId: create_webhook
+      parameters:
+      - explode: false
+        in: path
+        name: bank_id
+        required: true
+        schema:
+          title: Bank Id
+          type: string
+        style: simple
+      - explode: false
+        in: header
+        name: authorization
+        required: false
+        schema:
+          nullable: true
+          type: string
+        style: simple
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateWebhookRequest'
+        required: true
+      responses:
+        "201":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WebhookResponse'
+          description: Successful Response
+        "422":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      summary: Register webhook
+      tags:
+      - Webhooks
+  /v1/default/banks/{bank_id}/webhooks/{webhook_id}:
+    delete:
+      description: Remove a registered webhook.
+      operationId: delete_webhook
+      parameters:
+      - explode: false
+        in: path
+        name: bank_id
+        required: true
+        schema:
+          title: Bank Id
+          type: string
+        style: simple
+      - explode: false
+        in: path
+        name: webhook_id
+        required: true
+        schema:
+          title: Webhook Id
+          type: string
+        style: simple
+      - explode: false
+        in: header
+        name: authorization
+        required: false
+        schema:
+          nullable: true
+          type: string
+        style: simple
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DeleteResponse'
+          description: Successful Response
+        "422":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      summary: Delete webhook
+      tags:
+      - Webhooks
+    patch:
+      description: Update one or more fields of a registered webhook. Only provided
+        fields are changed.
+      operationId: update_webhook
+      parameters:
+      - explode: false
+        in: path
+        name: bank_id
+        required: true
+        schema:
+          title: Bank Id
+          type: string
+        style: simple
+      - explode: false
+        in: path
+        name: webhook_id
+        required: true
+        schema:
+          title: Webhook Id
+          type: string
+        style: simple
+      - explode: false
+        in: header
+        name: authorization
+        required: false
+        schema:
+          nullable: true
+          type: string
+        style: simple
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateWebhookRequest'
+        required: true
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WebhookResponse'
+          description: Successful Response
+        "422":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      summary: Update webhook
+      tags:
+      - Webhooks
+  /v1/default/banks/{bank_id}/webhooks/{webhook_id}/deliveries:
+    get:
+      description: Inspect delivery history for a webhook (useful for debugging).
+      operationId: list_webhook_deliveries
+      parameters:
+      - explode: false
+        in: path
+        name: bank_id
+        required: true
+        schema:
+          title: Bank Id
+          type: string
+        style: simple
+      - explode: false
+        in: path
+        name: webhook_id
+        required: true
+        schema:
+          title: Webhook Id
+          type: string
+        style: simple
+      - description: Maximum number of deliveries to return
+        explode: true
+        in: query
+        name: limit
+        required: false
+        schema:
+          default: 50
+          description: Maximum number of deliveries to return
+          maximum: 200
+          title: Limit
+          type: integer
+        style: form
+      - description: Pagination cursor (created_at of last item)
+        explode: true
+        in: query
+        name: cursor
+        required: false
+        schema:
+          nullable: true
+          type: string
+        style: form
+      - explode: false
+        in: header
+        name: authorization
+        required: false
+        schema:
+          nullable: true
+          type: string
+        style: simple
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WebhookDeliveryListResponse'
+          description: Successful Response
+        "422":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      summary: List webhook deliveries
+      tags:
+      - Webhooks
   /v1/default/banks/{bank_id}/memories:
     delete:
       description: "Delete memory units for a memory bank. Optionally filter by type\
@@ -2226,9 +2638,14 @@ paths:
 
         **Request format:** multipart/form-data with:
         - `files`: One or more files to upload
-        - `request`: JSON string with FileRetainRequest model (files_metadata)
+        - `request`: JSON string with FileRetainRequest model
 
-        **Note:** File parser is configured server-side via `HINDSIGHT_API_FILE_PARSER` (default: markitdown).
+        **Parser selection:**
+        - Set `parser` in the request body to override the server default for all files.
+        - Set `parser` inside a `files_metadata` entry for per-file control.
+        - Pass a list (e.g. `['iris', 'markitdown']`) to define an ordered fallback chain — each parser is tried in sequence until one succeeds.
+        - Falls back to the server default (`HINDSIGHT_API_FILE_PARSER`) if not specified.
+        - Only parsers enabled on the server may be requested; others return HTTP 400.
       operationId: file_retain
       parameters:
       - explode: false
@@ -2855,6 +3272,47 @@ components:
       required:
       - operation_id
       title: CreateMentalModelResponse
+    CreateWebhookRequest:
+      description: Request model for registering a webhook.
+      example:
+        event_types:
+        - event_types
+        - event_types
+        secret: secret
+        http_config:
+          headers:
+            key: headers
+          method: POST
+          timeout_seconds: 0
+          params:
+            key: params
+        url: url
+        enabled: true
+      properties:
+        url:
+          description: HTTP(S) endpoint URL to deliver events to
+          title: Url
+          type: string
+        secret:
+          nullable: true
+          type: string
+        event_types:
+          default:
+          - consolidation.completed
+          description: "List of event types to deliver. Currently supported: 'consolidation.completed'"
+          items:
+            type: string
+          type: array
+        enabled:
+          default: true
+          description: Whether this webhook is active
+          title: Enabled
+          type: boolean
+        http_config:
+          $ref: '#/components/schemas/WebhookHttpConfig'
+      required:
+      - url
+      title: CreateWebhookRequest
     DeleteDocumentResponse:
       description: Response model for delete document endpoint.
       example:
@@ -3477,9 +3935,7 @@ components:
           title: Content
           type: string
         timestamp:
-          format: date-time
-          nullable: true
-          type: string
+          $ref: '#/components/schemas/Timestamp'
         context:
           nullable: true
           type: string
@@ -3500,6 +3956,8 @@ components:
             type: string
           nullable: true
           type: array
+        observation_scopes:
+          $ref: '#/components/schemas/ObservationScopes'
       required:
       - content
       title: MemoryItem
@@ -4284,8 +4742,14 @@ components:
       properties:
         max_tokens:
           default: 4096
-          description: Maximum tokens for source facts
+          description: Maximum total tokens for source facts across all observations
+            (-1 = unlimited)
           title: Max Tokens
+          type: integer
+        max_tokens_per_observation:
+          default: -1
+          description: Maximum tokens of source facts per observation (-1 = unlimited)
+          title: Max Tokens Per Observation
           type: integer
       title: SourceFactsIncludeOptions
     TagItem:
@@ -4382,6 +4846,29 @@ components:
       required:
       - disposition
       title: UpdateDispositionRequest
+    UpdateDocumentRequest:
+      description: Request model for updating a document's mutable fields.
+      example:
+        tags:
+        - team-a
+        - team-b
+      properties:
+        tags:
+          items:
+            type: string
+          nullable: true
+          type: array
+      title: UpdateDocumentRequest
+    UpdateDocumentResponse:
+      description: Response model for update document endpoint.
+      example:
+        success: true
+      properties:
+        success:
+          default: true
+          title: Success
+          type: boolean
+      title: UpdateDocumentResponse
     UpdateMentalModelRequest:
       description: Request model for updating a mental model.
       example:
@@ -4413,6 +4900,41 @@ components:
         trigger:
           $ref: '#/components/schemas/MentalModelTrigger'
       title: UpdateMentalModelRequest
+    UpdateWebhookRequest:
+      description: Request model for updating a webhook. Only provided fields are
+        updated.
+      example:
+        event_types:
+        - event_types
+        - event_types
+        secret: secret
+        http_config:
+          headers:
+            key: headers
+          method: POST
+          timeout_seconds: 0
+          params:
+            key: params
+        url: url
+        enabled: true
+      properties:
+        url:
+          nullable: true
+          type: string
+        secret:
+          nullable: true
+          type: string
+        event_types:
+          items:
+            type: string
+          nullable: true
+          type: array
+        enabled:
+          nullable: true
+          type: boolean
+        http_config:
+          $ref: '#/components/schemas/WebhookHttpConfig'
+      title: UpdateWebhookRequest
     ValidationError:
       example:
         msg: msg
@@ -4457,6 +4979,274 @@ components:
       - api_version
       - features
       title: VersionResponse
+    WebhookDeliveryListResponse:
+      description: Response model for listing webhook deliveries.
+      example:
+        next_cursor: next_cursor
+        items:
+        - last_response_body: last_response_body
+          last_attempt_at: last_attempt_at
+          created_at: created_at
+          last_response_status: 6
+          url: url
+          event_type: event_type
+          updated_at: updated_at
+          webhook_id: webhook_id
+          next_retry_at: next_retry_at
+          id: id
+          last_error: last_error
+          status: status
+          attempts: 0
+        - last_response_body: last_response_body
+          last_attempt_at: last_attempt_at
+          created_at: created_at
+          last_response_status: 6
+          url: url
+          event_type: event_type
+          updated_at: updated_at
+          webhook_id: webhook_id
+          next_retry_at: next_retry_at
+          id: id
+          last_error: last_error
+          status: status
+          attempts: 0
+      properties:
+        items:
+          items:
+            $ref: '#/components/schemas/WebhookDeliveryResponse'
+          type: array
+        next_cursor:
+          nullable: true
+          type: string
+      required:
+      - items
+      title: WebhookDeliveryListResponse
+    WebhookDeliveryResponse:
+      description: Response model for a webhook delivery record.
+      example:
+        last_response_body: last_response_body
+        last_attempt_at: last_attempt_at
+        created_at: created_at
+        last_response_status: 6
+        url: url
+        event_type: event_type
+        updated_at: updated_at
+        webhook_id: webhook_id
+        next_retry_at: next_retry_at
+        id: id
+        last_error: last_error
+        status: status
+        attempts: 0
+      properties:
+        id:
+          title: Id
+          type: string
+        webhook_id:
+          nullable: true
+          type: string
+        url:
+          title: Url
+          type: string
+        event_type:
+          title: Event Type
+          type: string
+        status:
+          title: Status
+          type: string
+        attempts:
+          title: Attempts
+          type: integer
+        next_retry_at:
+          nullable: true
+          type: string
+        last_error:
+          nullable: true
+          type: string
+        last_response_status:
+          nullable: true
+          type: integer
+        last_response_body:
+          nullable: true
+          type: string
+        last_attempt_at:
+          nullable: true
+          type: string
+        created_at:
+          nullable: true
+          type: string
+        updated_at:
+          nullable: true
+          type: string
+      required:
+      - attempts
+      - event_type
+      - id
+      - status
+      - url
+      - webhook_id
+      title: WebhookDeliveryResponse
+    WebhookHttpConfig:
+      description: HTTP delivery configuration for a webhook.
+      example:
+        headers:
+          key: headers
+        method: POST
+        timeout_seconds: 0
+        params:
+          key: params
+      properties:
+        method:
+          default: POST
+          description: "HTTP method: GET or POST"
+          title: Method
+          type: string
+        timeout_seconds:
+          default: 30
+          description: HTTP request timeout in seconds
+          title: Timeout Seconds
+          type: integer
+        headers:
+          additionalProperties:
+            type: string
+          description: Custom HTTP headers
+          title: Headers
+        params:
+          additionalProperties:
+            type: string
+          description: Custom HTTP query parameters
+          title: Params
+      title: WebhookHttpConfig
+    WebhookListResponse:
+      description: Response model for listing webhooks.
+      example:
+        items:
+        - event_types:
+          - event_types
+          - event_types
+          updated_at: updated_at
+          bank_id: bank_id
+          created_at: created_at
+          id: id
+          secret: secret
+          http_config:
+            headers:
+              key: headers
+            method: POST
+            timeout_seconds: 0
+            params:
+              key: params
+          url: url
+          enabled: true
+        - event_types:
+          - event_types
+          - event_types
+          updated_at: updated_at
+          bank_id: bank_id
+          created_at: created_at
+          id: id
+          secret: secret
+          http_config:
+            headers:
+              key: headers
+            method: POST
+            timeout_seconds: 0
+            params:
+              key: params
+          url: url
+          enabled: true
+      properties:
+        items:
+          items:
+            $ref: '#/components/schemas/WebhookResponse'
+          type: array
+      required:
+      - items
+      title: WebhookListResponse
+    WebhookResponse:
+      description: Response model for a webhook.
+      example:
+        event_types:
+        - event_types
+        - event_types
+        updated_at: updated_at
+        bank_id: bank_id
+        created_at: created_at
+        id: id
+        secret: secret
+        http_config:
+          headers:
+            key: headers
+          method: POST
+          timeout_seconds: 0
+          params:
+            key: params
+        url: url
+        enabled: true
+      properties:
+        id:
+          title: Id
+          type: string
+        bank_id:
+          nullable: true
+          type: string
+        url:
+          title: Url
+          type: string
+        secret:
+          nullable: true
+          type: string
+        event_types:
+          items:
+            type: string
+          type: array
+        enabled:
+          title: Enabled
+          type: boolean
+        http_config:
+          $ref: '#/components/schemas/WebhookHttpConfig'
+        created_at:
+          nullable: true
+          type: string
+        updated_at:
+          nullable: true
+          type: string
+      required:
+      - bank_id
+      - enabled
+      - event_types
+      - id
+      - url
+      title: WebhookResponse
+    Timestamp:
+      anyOf:
+      - format: date-time
+        type: string
+      - type: string
+      description: "When the content occurred. Accepts an ISO 8601 datetime string\
+        \ (e.g. '2024-01-15T10:30:00Z'), null/omitted (defaults to now), or the special\
+        \ string 'unset' to explicitly store without any timestamp (use this for timeless\
+        \ content such as fictional documents or static reference material)."
+      nullable: true
+      title: Timestamp
+    ObservationScopes:
+      anyOf:
+      - enum:
+        - per_tag
+        - combined
+        - all_combinations
+        type: string
+      - items:
+          items:
+            type: string
+          type: array
+        type: array
+      description: "How to scope observations during consolidation. 'per_tag' runs\
+        \ one consolidation pass per individual tag, creating separate observations\
+        \ for each tag. 'combined' (default) runs a single pass with all tags together.\
+        \ A list of tag lists runs one pass per inner list, giving full control over\
+        \ which combinations to use."
+      nullable: true
+      title: ObservationScopes
     ValidationError_loc_inner:
       anyOf:
       - type: string

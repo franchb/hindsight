@@ -11,6 +11,7 @@ import json
 import logging
 import os
 import time
+from contextvars import ContextVar
 from typing import Any
 
 from google import genai
@@ -23,6 +24,12 @@ from hindsight_api.engine.response_models import LLMToolCall, LLMToolCallResult,
 from hindsight_api.metrics import get_metrics_collector
 
 logger = logging.getLogger(__name__)
+
+# Per-request Gemini safety settings override.
+# Set exclusively by ConfiguredLLMProvider.call() / call_with_tools() via token-based
+# set/reset, so it is properly scoped to each individual LLM call and never leaks.
+_safety_settings_ctx: ContextVar[list | None] = ContextVar("gemini_safety_settings", default=None)
+
 
 # Vertex AI imports (optional)
 try:
@@ -57,6 +64,9 @@ class GeminiLLM(LLMInterface):
 
         self._client = None
         self._is_vertexai = self.provider == "vertexai"
+
+        # Safety settings: None means use Gemini's defaults
+        self._safety_settings: list | None = kwargs.get("gemini_safety_settings")
 
         if self._is_vertexai:
             self._init_vertexai(**kwargs)
@@ -215,6 +225,16 @@ class GeminiLLM(LLMInterface):
             config_kwargs["response_schema"] = response_format
         if temperature is not None:
             config_kwargs["temperature"] = temperature
+
+        # Apply safety settings: context var (per-request bank override) takes precedence over instance default
+        effective_safety_settings = _safety_settings_ctx.get()
+        if effective_safety_settings is None:
+            effective_safety_settings = self._safety_settings
+        if effective_safety_settings is not None:
+            config_kwargs["safety_settings"] = [
+                genai_types.SafetySetting(category=s["category"], threshold=s["threshold"])
+                for s in effective_safety_settings
+            ]
 
         generation_config = genai_types.GenerateContentConfig(**config_kwargs) if config_kwargs else None
 
@@ -488,6 +508,16 @@ class GeminiLLM(LLMInterface):
                 function_calling_config=genai_types.FunctionCallingConfig(mode="NONE")
             )
         # "auto" is the default (no tool_config needed)
+
+        # Apply safety settings: context var (per-request bank override) takes precedence over instance default
+        effective_safety_settings = _safety_settings_ctx.get()
+        if effective_safety_settings is None:
+            effective_safety_settings = self._safety_settings
+        if effective_safety_settings is not None:
+            config_kwargs["safety_settings"] = [
+                genai_types.SafetySetting(category=s["category"], threshold=s["threshold"])
+                for s in effective_safety_settings
+            ]
 
         config = genai_types.GenerateContentConfig(**config_kwargs)
 

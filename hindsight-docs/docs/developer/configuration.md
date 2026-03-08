@@ -531,6 +531,7 @@ For advanced authentication (JWT, OAuth, multi-tenant schemas), implement a cust
 | `HINDSIGHT_API_RERANKER_MAX_CANDIDATES` | Max candidates to rerank per recall (RRF pre-filters the rest) | `300` |
 | `HINDSIGHT_API_MPFP_TOP_K_NEIGHBORS` | Fan-out limit per node in MPFP graph traversal | `20` |
 | `HINDSIGHT_API_MENTAL_MODEL_REFRESH_CONCURRENCY` | Max concurrent mental model refreshes | `8` |
+| `HINDSIGHT_API_ENABLE_MENTAL_MODEL_HISTORY` | Track history of content changes to each mental model (previous content + timestamp). Disable to reduce storage if audit trails are not needed. | `true` |
 
 #### Graph Retrieval Algorithms
 
@@ -552,6 +553,8 @@ Controls the retain (memory ingestion) pipeline.
 | `HINDSIGHT_API_RETAIN_EXTRACT_CAUSAL_LINKS` | Extract causal relationships between facts | `true` |
 | `HINDSIGHT_API_RETAIN_BATCH_ENABLED` | Use LLM Batch API for fact extraction (50% cost savings, only with async operations) | `false` |
 | `HINDSIGHT_API_RETAIN_BATCH_POLL_INTERVAL_SECONDS` | Batch API polling interval in seconds | `60` |
+
+> **Entity labels** (`entity_labels`) and **free-form entity extraction** (`entities_allow_free_form`) are configured per bank via the [bank config API](/developer/api/memory-banks#retain-configuration), not as global environment variables — each bank can have its own controlled vocabulary. See [Entity Labels](/developer/retain#entity-labels) for details.
 
 #### Customizing retain: when to use what
 
@@ -601,10 +604,36 @@ Configuration for the file upload and conversion pipeline (used by `POST /v1/def
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `HINDSIGHT_API_ENABLE_FILE_UPLOAD_API` | Enable the file upload API endpoint | `true` |
-| `HINDSIGHT_API_FILE_PARSER` | File parser to use (`markitdown`, `iris`) | `markitdown` |
+| `HINDSIGHT_API_FILE_PARSER` | Server-side default parser or fallback chain (comma-separated, e.g. `iris,markitdown`) | `markitdown` |
+| `HINDSIGHT_API_FILE_PARSER_ALLOWLIST` | Comma-separated list of parsers clients are allowed to request. If not set, all registered parsers are allowed. | — |
 | `HINDSIGHT_API_FILE_CONVERSION_MAX_BATCH_SIZE` | Max files per upload request | `10` |
 | `HINDSIGHT_API_FILE_CONVERSION_MAX_BATCH_SIZE_MB` | Max total upload size per request (MB) | `100` |
 | `HINDSIGHT_API_FILE_DELETE_AFTER_RETAIN` | Delete stored files after memory extraction completes | `true` |
+
+#### Parser selection
+
+Clients can override the server default by passing `parser` in the request body of `POST /v1/default/banks/{bank_id}/files/retain`. Both the server default and the per-request field accept a single parser name or an ordered **fallback chain** — each parser is tried in sequence until one succeeds.
+
+```bash
+# Server default: try iris first, fall back to markitdown if iris fails
+export HINDSIGHT_API_FILE_PARSER=iris,markitdown
+
+# Restrict what clients may request (optional — defaults to all registered parsers)
+export HINDSIGHT_API_FILE_PARSER_ALLOWLIST=markitdown,iris
+```
+
+```json
+// Per-request override (in the JSON body of the file retain endpoint)
+{
+  "parser": "iris",
+  "files_metadata": [
+    { "document_id": "report" },
+    { "document_id": "fallback_doc", "parser": ["iris", "markitdown"] }
+  ]
+}
+```
+
+Clients that request a parser not in the allowlist receive HTTP 400.
 
 #### Parser: markitdown (default)
 
@@ -624,10 +653,13 @@ Cloud-based extraction via [Vectorize Iris](https://docs.vectorize.io/build-depl
 **Supported formats:** PDF, DOCX, DOC, PPTX, PPT, XLSX, XLS, images (JPG, JPEG, PNG, GIF, BMP, TIFF, WEBP), HTML, TXT, MD, CSV.
 
 ```bash
-# Use iris parser (requires Vectorize account)
+# Use iris as the only parser
 export HINDSIGHT_API_FILE_PARSER=iris
 export HINDSIGHT_API_FILE_PARSER_IRIS_TOKEN=your-vectorize-token
 export HINDSIGHT_API_FILE_PARSER_IRIS_ORG_ID=your-org-id
+
+# Or: try iris first, fall back to markitdown if iris fails or rejects the file type
+export HINDSIGHT_API_FILE_PARSER=iris,markitdown
 ```
 
 ```bash
@@ -724,16 +756,19 @@ export HINDSIGHT_API_FILE_STORAGE_AZURE_ACCOUNT_KEY=base64encodedkey==
 For production deployments, use `s3`, `gcs`, or `azure` to avoid storing large binary files in your PostgreSQL database. Set `HINDSIGHT_API_FILE_DELETE_AFTER_RETAIN=true` (the default) to delete files after memory extraction, which minimizes storage costs.
 :::
 
-### Observations (Experimental)
+### Observations (Experimental) {#observations}
 
 Observations are consolidated knowledge synthesized from facts.
 
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `HINDSIGHT_API_ENABLE_OBSERVATIONS` | Enable observation consolidation | `true` |
+| `HINDSIGHT_API_ENABLE_OBSERVATION_HISTORY` | Track history of changes to each observation (previous content + timestamp). Disable to reduce storage if audit trails are not needed. | `true` |
 | `HINDSIGHT_API_CONSOLIDATION_BATCH_SIZE` | Memories to load per batch (internal optimization) | `50` |
 | `HINDSIGHT_API_CONSOLIDATION_MAX_TOKENS` | Max tokens for recall when finding related observations during consolidation | `1024` |
-| `HINDSIGHT_API_CONSOLIDATION_LLM_BATCH_SIZE` | Number of facts sent to the LLM in a single consolidation call. Higher values reduce LLM calls and improve throughput at the cost of larger prompts. Set to `1` to disable batching. | `8` |
+| `HINDSIGHT_API_CONSOLIDATION_LLM_BATCH_SIZE` | Number of facts sent to the LLM in a single consolidation call. Higher values reduce LLM calls and improve throughput at the cost of larger prompts. Set to `1` to disable batching. Configurable per bank. | `8` |
+| `HINDSIGHT_API_CONSOLIDATION_SOURCE_FACTS_MAX_TOKENS` | Total token budget for source facts included with observations in the consolidation prompt. `-1` = unlimited. Configurable per bank. | `-1` |
+| `HINDSIGHT_API_CONSOLIDATION_SOURCE_FACTS_MAX_TOKENS_PER_OBSERVATION` | Per-observation token cap for source facts in the consolidation prompt. Each observation independently gets at most this many tokens of source facts. `-1` = unlimited. Configurable per bank. | `256` |
 | `HINDSIGHT_API_OBSERVATIONS_MISSION` | What this bank should synthesise into durable observations. Replaces the built-in consolidation rules — leave unset to use the server default. | - |
 
 #### Customizing observations: when to use what
@@ -780,6 +815,7 @@ export HINDSIGHT_API_OBSERVATIONS_MISSION="Observations are recurring patterns i
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `HINDSIGHT_API_REFLECT_MAX_ITERATIONS` | Max tool call iterations before forcing a response | `10` |
+| `HINDSIGHT_API_REFLECT_MAX_CONTEXT_TOKENS` | Max accumulated context tokens in the reflect loop before forcing final synthesis. Prevents `context_length_exceeded` errors on large banks. Lower this if your LLM has a context window smaller than 128K. | `100000` |
 | `HINDSIGHT_API_REFLECT_MISSION` | Global reflect mission (identity and reasoning framing). Overridden per bank via config API. | - |
 
 #### Disposition

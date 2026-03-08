@@ -20,6 +20,7 @@ from hindsight_api.config import (
 )
 from hindsight_api.engine.memory_engine import Budget
 from hindsight_api.engine.response_models import VALID_RECALL_FACT_TYPES
+from hindsight_api.extensions import OperationValidationError
 from hindsight_api.models import RequestContext
 
 logger = logging.getLogger(__name__)
@@ -52,7 +53,6 @@ class MCPToolsConfig:
     recall_description: str | None = None
 
     # Retain behavior
-    retain_fire_and_forget: bool = False  # If True, use asyncio.create_task pattern
 
 
 def _get_request_context(config: MCPToolsConfig) -> RequestContext:
@@ -271,48 +271,71 @@ def register_mcp_tools(
 def _apply_bank_tool_filtering(mcp: FastMCP, memory: MemoryEngine, config: MCPToolsConfig) -> None:
     """Filter bank-level mcp_enabled_tools from both tools/list and tool invocation.
 
-    Wraps _tool_manager.get_tools() so that:
-    - tools/list only returns permitted tools (they are hidden, not just blocked)
-    - tools/call for a disabled tool raises NotFoundError (via the manager) before run()
-
-    tool.run wrappers are kept as defense-in-depth for any caller that bypasses the manager.
+    Compatible with FastMCP 2.x (_tool_manager pattern) and 3.x (provider pattern).
     """
-    try:
-        tool_manager = mcp._tool_manager
-        original_get_tools = tool_manager.get_tools
 
-        async def _filtered_get_tools():
-            all_tools = await original_get_tools()
-            bank_id = config.bank_id_resolver()
-            if not bank_id:
-                return all_tools
-            request_context = _get_request_context(config)
-            bank_cfg = await memory._config_resolver.get_bank_config(bank_id, request_context)
-            enabled: list[str] | None = bank_cfg.get("mcp_enabled_tools")
-            if enabled is None:
-                return all_tools
-            enabled_set = set(enabled)
-            return {k: v for k, v in all_tools.items() if k in enabled_set}
+    async def _get_enabled_tools() -> set[str] | None:
+        """Return the enabled tool set for the current bank, or None if unrestricted."""
+        bank_id = config.bank_id_resolver()
+        if not bank_id:
+            return None
+        request_context = _get_request_context(config)
+        bank_cfg = await memory._config_resolver.get_bank_config(bank_id, request_context)
+        enabled: list[str] | None = bank_cfg.get("mcp_enabled_tools")
+        if enabled is None:
+            return None
+        return set(enabled)
 
-        setattr(tool_manager, "get_tools", _filtered_get_tools)
+    if hasattr(mcp, "list_tools"):
+        # FastMCP 3.x: wrap list_tools() and get_tool() on the instance
+        original_list_tools = mcp.list_tools
+        original_get_tool = mcp.get_tool
 
-        # Defense-in-depth: also wrap tool.run for any direct caller that bypasses the manager
-        for name, tool in tool_manager._tools.items():
-            original_run = tool.run
+        async def _filtered_list_tools(**kwargs):
+            tools = await original_list_tools(**kwargs)
+            enabled_set = await _get_enabled_tools()
+            if enabled_set is None:
+                return tools
+            return [t for t in tools if t.name in enabled_set]
 
-            async def _filtered_run(arguments, _name=name, _orig=original_run):
-                bank_id = config.bank_id_resolver()
-                if bank_id:
-                    request_context = _get_request_context(config)
-                    bank_cfg = await memory._config_resolver.get_bank_config(bank_id, request_context)
-                    enabled: list[str] | None = bank_cfg.get("mcp_enabled_tools")
-                    if enabled is not None and _name not in enabled:
-                        raise ValueError(f"Tool '{_name}' is not enabled for bank '{bank_id}'")
-                return await _orig(arguments)
+        async def _filtered_get_tool(name, **kwargs):
+            enabled_set = await _get_enabled_tools()
+            if enabled_set is not None and name not in enabled_set:
+                return None  # FastMCP treats None as "not found" → raises NotFoundError
+            return await original_get_tool(name, **kwargs)
 
-            object.__setattr__(tool, "run", _filtered_run)
-    except (AttributeError, KeyError) as e:
-        logger.warning(f"Could not apply bank tool filtering: {e}")
+        object.__setattr__(mcp, "list_tools", _filtered_list_tools)
+        object.__setattr__(mcp, "get_tool", _filtered_get_tool)
+
+    elif hasattr(mcp, "_tool_manager"):
+        # FastMCP 2.x: wrap _tool_manager.get_tools() and tool.run()
+        try:
+            tool_manager = mcp._tool_manager
+            original_get_tools = tool_manager.get_tools
+
+            async def _filtered_get_tools():
+                all_tools = await original_get_tools()
+                enabled_set = await _get_enabled_tools()
+                if enabled_set is None:
+                    return all_tools
+                return {k: v for k, v in all_tools.items() if k in enabled_set}
+
+            setattr(tool_manager, "get_tools", _filtered_get_tools)
+
+            for name, tool in tool_manager._tools.items():
+                original_run = tool.run
+
+                async def _filtered_run(arguments, _name=name, _orig=original_run):
+                    enabled_set = await _get_enabled_tools()
+                    if enabled_set is not None and _name not in enabled_set:
+                        raise ValueError(f"Tool '{_name}' is not enabled for bank '{config.bank_id_resolver()}'")
+                    return await _orig(arguments)
+
+                object.__setattr__(tool, "run", _filtered_run)
+        except (AttributeError, KeyError) as e:
+            logger.warning(f"Could not apply bank tool filtering (v2): {e}")
+    else:
+        logger.warning("Could not apply bank tool filtering: unknown FastMCP version")
 
 
 def _register_retain(mcp: FastMCP, memory: MemoryEngine, config: MCPToolsConfig) -> None:
@@ -320,106 +343,56 @@ def _register_retain(mcp: FastMCP, memory: MemoryEngine, config: MCPToolsConfig)
     description = config.retain_description or DEFAULT_MCP_RETAIN_DESCRIPTION
 
     if config.include_bank_id_param:
-        if config.retain_fire_and_forget:
 
-            @mcp.tool(description=description)
-            async def retain(
-                content: str,
-                context: str = "general",
-                timestamp: str | None = None,
-                tags: list[str] | None = None,
-                metadata: dict[str, str] | None = None,
-                document_id: str | None = None,
-                bank_id: str | None = None,
-            ) -> dict:
-                """
-                Args:
-                    content: The fact/memory to store (be specific and include relevant details)
-                    context: Category for the memory (e.g., 'preferences', 'work', 'hobbies', 'family'). Default: 'general'
-                    timestamp: When this event/fact occurred (ISO format, e.g., '2024-01-15T10:30:00Z'). Useful for timeline tracking.
-                    tags: Optional tags for scoped visibility filtering (e.g., ['project:alpha', 'user:123'])
-                    metadata: Optional key-value metadata to attach (e.g., {'source': 'slack', 'channel': 'general'})
-                    document_id: Optional document ID to associate this memory with
-                    bank_id: Optional bank to store in (defaults to session bank). Use for cross-bank operations.
-                """
-                import asyncio
+        @mcp.tool(description=description)
+        async def retain(
+            content: str,
+            context: str = "general",
+            timestamp: str | None = None,
+            tags: list[str] | None = None,
+            metadata: dict[str, str] | None = None,
+            document_id: str | None = None,
+            bank_id: str | None = None,
+        ) -> dict:
+            """
+            Args:
+                content: The fact/memory to store (be specific and include relevant details)
+                context: Category for the memory (e.g., 'preferences', 'work', 'hobbies', 'family'). Default: 'general'
+                timestamp: When this event/fact occurred (ISO format, e.g., '2024-01-15T10:30:00Z'). Useful for timeline tracking.
+                tags: Optional tags for scoped visibility filtering (e.g., ['project:alpha', 'user:123'])
+                metadata: Optional key-value metadata to attach (e.g., {'source': 'slack', 'channel': 'general'})
+                document_id: Optional document ID to associate this memory with
+                bank_id: Optional bank to store in (defaults to session bank). Use for cross-bank operations.
+            """
+            target_bank = bank_id or config.bank_id_resolver()
+            if target_bank is None:
+                return {"status": "error", "message": "No bank_id configured"}
 
-                target_bank = bank_id or config.bank_id_resolver()
-                if target_bank is None:
-                    return {"status": "error", "message": "No bank_id configured"}
+            content_dict, error = build_content_dict(content, context, timestamp, tags, metadata, document_id)
+            if error:
+                return {"status": "error", "message": error}
 
-                content_dict, error = build_content_dict(content, context, timestamp, tags, metadata, document_id)
-                if error:
-                    return {"status": "error", "message": error}
+            request_context = _get_request_context(config)
 
-                request_context = _get_request_context(config)
-
-                async def _retain():
-                    try:
-                        await memory.retain_batch_async(
-                            bank_id=target_bank,
-                            contents=[content_dict],
-                            request_context=request_context,
-                        )
-                    except Exception as e:
-                        logger.error(f"Error storing memory: {e}", exc_info=True)
-
-                asyncio.create_task(_retain())
-                return {"status": "accepted", "message": "Memory storage initiated"}
-
-        else:
-
-            @mcp.tool(description=description)
-            async def retain(
-                content: str,
-                context: str = "general",
-                timestamp: str | None = None,
-                tags: list[str] | None = None,
-                metadata: dict[str, str] | None = None,
-                document_id: str | None = None,
-                async_processing: bool = True,
-                bank_id: str | None = None,
-            ) -> str:
-                """
-                Args:
-                    content: The fact/memory to store (be specific and include relevant details)
-                    context: Category for the memory (e.g., 'preferences', 'work', 'hobbies', 'family'). Default: 'general'
-                    timestamp: When this event/fact occurred (ISO format, e.g., '2024-01-15T10:30:00Z'). Useful for timeline tracking.
-                    tags: Optional tags for scoped visibility filtering (e.g., ['project:alpha', 'user:123'])
-                    metadata: Optional key-value metadata to attach (e.g., {'source': 'slack', 'channel': 'general'})
-                    document_id: Optional document ID to associate this memory with
-                    async_processing: If True, queue for background processing and return immediately. If False, wait for completion. Default: True
-                    bank_id: Optional bank to store in (defaults to session bank). Use for cross-bank operations.
-                """
-                try:
-                    target_bank = bank_id or config.bank_id_resolver()
-                    if target_bank is None:
-                        return "Error: No bank_id configured"
-
-                    content_dict, error = build_content_dict(content, context, timestamp, tags, metadata, document_id)
-                    if error:
-                        return f"Error: {error}"
-
-                    contents = [content_dict]
-                    request_context = _get_request_context(config)
-                    if async_processing:
-                        result = await memory.submit_async_retain(
-                            bank_id=target_bank, contents=contents, request_context=request_context
-                        )
-                        return f"Memory queued for background processing (operation_id: {result.get('operation_id', 'N/A')})"
-                    else:
-                        await memory.retain_batch_async(
-                            bank_id=target_bank,
-                            contents=contents,
-                            request_context=request_context,
-                        )
-                        return f"Memory stored successfully in bank '{target_bank}'"
-                except Exception as e:
-                    logger.error(f"Error storing memory: {e}", exc_info=True)
-                    return f"Error: {str(e)}"
+            try:
+                result = await memory.submit_async_retain(
+                    bank_id=target_bank,
+                    contents=[content_dict],
+                    request_context=request_context,
+                )
+                return {
+                    "status": "accepted",
+                    "message": "Memory storage initiated",
+                    "operation_id": result.get("operation_id"),
+                }
+            except OperationValidationError as e:
+                logger.warning(f"Retain rejected: {e}")
+                return {"status": "error", "message": str(e)}
+            except Exception as e:
+                logger.error(f"Error storing memory: {e}", exc_info=True)
+                return {"status": "error", "message": str(e)}
 
     else:
-        # No bank_id param - use fixed bank from resolver
 
         @mcp.tool(description=description)
         async def retain(
@@ -439,8 +412,6 @@ def _register_retain(mcp: FastMCP, memory: MemoryEngine, config: MCPToolsConfig)
                 metadata: Optional key-value metadata to attach (e.g., {'source': 'slack', 'channel': 'general'})
                 document_id: Optional document ID to associate this memory with
             """
-            import asyncio
-
             target_bank = config.bank_id_resolver()
             if target_bank is None:
                 return {"status": "error", "message": "No bank_id configured"}
@@ -451,18 +422,23 @@ def _register_retain(mcp: FastMCP, memory: MemoryEngine, config: MCPToolsConfig)
 
             request_context = _get_request_context(config)
 
-            async def _retain():
-                try:
-                    await memory.retain_batch_async(
-                        bank_id=target_bank,
-                        contents=[content_dict],
-                        request_context=request_context,
-                    )
-                except Exception as e:
-                    logger.error(f"Error storing memory: {e}", exc_info=True)
-
-            asyncio.create_task(_retain())
-            return {"status": "accepted", "message": "Memory storage initiated"}
+            try:
+                result = await memory.submit_async_retain(
+                    bank_id=target_bank,
+                    contents=[content_dict],
+                    request_context=request_context,
+                )
+                return {
+                    "status": "accepted",
+                    "message": "Memory storage initiated",
+                    "operation_id": result.get("operation_id"),
+                }
+            except OperationValidationError as e:
+                logger.warning(f"Retain rejected: {e}")
+                return {"status": "error", "message": str(e)}
+            except Exception as e:
+                logger.error(f"Error storing memory: {e}", exc_info=True)
+                return {"status": "error", "message": str(e)}
 
 
 def _register_recall(mcp: FastMCP, memory: MemoryEngine, config: MCPToolsConfig) -> None:
@@ -519,6 +495,9 @@ def _register_recall(mcp: FastMCP, memory: MemoryEngine, config: MCPToolsConfig)
                 recall_result = await memory.recall_async(**recall_kwargs)
 
                 return recall_result.model_dump_json(indent=2)
+            except OperationValidationError as e:
+                logger.warning(f"Recall rejected: {e}")
+                return json.dumps({"error": str(e), "results": []})
             except ValueError as e:
                 return f'{{"error": "{e}", "results": []}}'
             except Exception as e:
@@ -573,6 +552,9 @@ def _register_recall(mcp: FastMCP, memory: MemoryEngine, config: MCPToolsConfig)
                 recall_result = await memory.recall_async(**recall_kwargs)
 
                 return recall_result.model_dump()
+            except OperationValidationError as e:
+                logger.warning(f"Recall rejected: {e}")
+                return {"error": str(e), "results": []}
             except ValueError as e:
                 return {"error": str(e), "results": []}
             except Exception as e:
@@ -653,6 +635,9 @@ def _register_reflect(mcp: FastMCP, memory: MemoryEngine, config: MCPToolsConfig
                 if response_schema is not None and hasattr(reflect_result, "structured_output"):
                     result_data["structured_output"] = reflect_result.structured_output
                 return json.dumps(result_data, indent=2)
+            except OperationValidationError as e:
+                logger.warning(f"Reflect rejected: {e}")
+                return json.dumps({"error": str(e)})
             except Exception as e:
                 logger.error(f"Error reflecting: {e}", exc_info=True)
                 return f'{{"error": "{e}", "text": ""}}'
@@ -725,6 +710,9 @@ def _register_reflect(mcp: FastMCP, memory: MemoryEngine, config: MCPToolsConfig
                 if response_schema is not None and hasattr(reflect_result, "structured_output"):
                     result_data["structured_output"] = reflect_result.structured_output
                 return result_data
+            except OperationValidationError as e:
+                logger.warning(f"Reflect rejected: {e}")
+                return {"error": str(e)}
             except Exception as e:
                 logger.error(f"Error reflecting: {e}", exc_info=True)
                 return {"error": str(e), "text": ""}
@@ -747,6 +735,9 @@ def _register_list_banks(mcp: FastMCP, memory: MemoryEngine, config: MCPToolsCon
         try:
             banks = await memory.list_banks(request_context=_get_request_context(config))
             return json.dumps({"banks": banks}, indent=2)
+        except OperationValidationError as e:
+            logger.warning(f"Operation rejected: {e}")
+            return json.dumps({"error": str(e), "banks": []})
         except Exception as e:
             logger.error(f"Error listing banks: {e}", exc_info=True)
             return f'{{"error": "{e}", "banks": []}}'
@@ -788,6 +779,9 @@ def _register_create_bank(mcp: FastMCP, memory: MemoryEngine, config: MCPToolsCo
             if "disposition" in profile and hasattr(profile["disposition"], "model_dump"):
                 profile["disposition"] = profile["disposition"].model_dump()
             return json.dumps(profile, indent=2)
+        except OperationValidationError as e:
+            logger.warning(f"Operation rejected: {e}")
+            return json.dumps({"error": str(e)})
         except Exception as e:
             logger.error(f"Error creating bank: {e}", exc_info=True)
             return f'{{"error": "{e}"}}'
@@ -843,6 +837,9 @@ def _register_list_mental_models(mcp: FastMCP, memory: MemoryEngine, config: MCP
                     request_context=_get_request_context(config),
                 )
                 return json.dumps({"items": models}, indent=2, default=str)
+            except OperationValidationError as e:
+                logger.warning(f"Operation rejected: {e}")
+                return json.dumps({"error": str(e)})
             except Exception as e:
                 logger.error(f"Error listing mental models: {e}", exc_info=True)
                 return f'{{"error": "{e}", "items": []}}'
@@ -874,6 +871,9 @@ def _register_list_mental_models(mcp: FastMCP, memory: MemoryEngine, config: MCP
                     request_context=_get_request_context(config),
                 )
                 return {"items": models}
+            except OperationValidationError as e:
+                logger.warning(f"Operation rejected: {e}")
+                return {"error": str(e)}
             except Exception as e:
                 logger.error(f"Error listing mental models: {e}", exc_info=True)
                 return {"error": str(e), "items": []}
@@ -912,6 +912,9 @@ def _register_get_mental_model(mcp: FastMCP, memory: MemoryEngine, config: MCPTo
                 if model is None:
                     return json.dumps({"error": f"Mental model '{mental_model_id}' not found in bank '{target_bank}'"})
                 return json.dumps(model, indent=2, default=str)
+            except OperationValidationError as e:
+                logger.warning(f"Operation rejected: {e}")
+                return json.dumps({"error": str(e)})
             except Exception as e:
                 logger.error(f"Error getting mental model: {e}", exc_info=True)
                 return f'{{"error": "{e}"}}'
@@ -944,6 +947,9 @@ def _register_get_mental_model(mcp: FastMCP, memory: MemoryEngine, config: MCPTo
                 if model is None:
                     return {"error": f"Mental model '{mental_model_id}' not found in bank '{target_bank}'"}
                 return model
+            except OperationValidationError as e:
+                logger.warning(f"Operation rejected: {e}")
+                return {"error": str(e)}
             except Exception as e:
                 logger.error(f"Error getting mental model: {e}", exc_info=True)
                 return {"error": str(e)}
@@ -1027,6 +1033,9 @@ def _register_create_mental_model(mcp: FastMCP, memory: MemoryEngine, config: MC
                         "message": f"Mental model '{name}' created. Content is being generated asynchronously.",
                     }
                 )
+            except OperationValidationError as e:
+                logger.warning(f"Operation rejected: {e}")
+                return json.dumps({"error": str(e)})
             except ValueError as e:
                 return json.dumps({"error": str(e)})
             except Exception as e:
@@ -1102,6 +1111,9 @@ def _register_create_mental_model(mcp: FastMCP, memory: MemoryEngine, config: MC
                     "status": "created",
                     "message": f"Mental model '{name}' created. Content is being generated asynchronously.",
                 }
+            except OperationValidationError as e:
+                logger.warning(f"Operation rejected: {e}")
+                return {"error": str(e)}
             except ValueError as e:
                 return {"error": str(e)}
             except Exception as e:
@@ -1166,6 +1178,9 @@ def _register_update_mental_model(mcp: FastMCP, memory: MemoryEngine, config: MC
                 if model is None:
                     return json.dumps({"error": f"Mental model '{mental_model_id}' not found in bank '{target_bank}'"})
                 return json.dumps(model, indent=2, default=str)
+            except OperationValidationError as e:
+                logger.warning(f"Operation rejected: {e}")
+                return json.dumps({"error": str(e)})
             except Exception as e:
                 logger.error(f"Error updating mental model: {e}", exc_info=True)
                 return f'{{"error": "{e}"}}'
@@ -1222,6 +1237,9 @@ def _register_update_mental_model(mcp: FastMCP, memory: MemoryEngine, config: MC
                 if model is None:
                     return {"error": f"Mental model '{mental_model_id}' not found in bank '{target_bank}'"}
                 return model
+            except OperationValidationError as e:
+                logger.warning(f"Operation rejected: {e}")
+                return {"error": str(e)}
             except Exception as e:
                 logger.error(f"Error updating mental model: {e}", exc_info=True)
                 return {"error": str(e)}
@@ -1259,6 +1277,9 @@ def _register_delete_mental_model(mcp: FastMCP, memory: MemoryEngine, config: MC
                 if not deleted:
                     return json.dumps({"error": f"Mental model '{mental_model_id}' not found in bank '{target_bank}'"})
                 return json.dumps({"status": "deleted", "mental_model_id": mental_model_id})
+            except OperationValidationError as e:
+                logger.warning(f"Operation rejected: {e}")
+                return json.dumps({"error": str(e)})
             except Exception as e:
                 logger.error(f"Error deleting mental model: {e}", exc_info=True)
                 return f'{{"error": "{e}"}}'
@@ -1290,6 +1311,9 @@ def _register_delete_mental_model(mcp: FastMCP, memory: MemoryEngine, config: MC
                 if not deleted:
                     return {"error": f"Mental model '{mental_model_id}' not found in bank '{target_bank}'"}
                 return {"status": "deleted", "mental_model_id": mental_model_id}
+            except OperationValidationError as e:
+                logger.warning(f"Operation rejected: {e}")
+                return {"error": str(e)}
             except Exception as e:
                 logger.error(f"Error deleting mental model: {e}", exc_info=True)
                 return {"error": str(e)}
@@ -1333,6 +1357,9 @@ def _register_refresh_mental_model(mcp: FastMCP, memory: MemoryEngine, config: M
                         "message": f"Refresh queued for mental model '{mental_model_id}'.",
                     }
                 )
+            except OperationValidationError as e:
+                logger.warning(f"Operation rejected: {e}")
+                return json.dumps({"error": str(e)})
             except ValueError as e:
                 return json.dumps({"error": str(e)})
             except Exception as e:
@@ -1370,6 +1397,9 @@ def _register_refresh_mental_model(mcp: FastMCP, memory: MemoryEngine, config: M
                     "status": "queued",
                     "message": f"Refresh queued for mental model '{mental_model_id}'.",
                 }
+            except OperationValidationError as e:
+                logger.warning(f"Operation rejected: {e}")
+                return {"error": str(e)}
             except ValueError as e:
                 return {"error": str(e)}
             except Exception as e:
@@ -1416,6 +1446,9 @@ def _register_list_directives(mcp: FastMCP, memory: MemoryEngine, config: MCPToo
                     request_context=_get_request_context(config),
                 )
                 return json.dumps({"items": directives}, indent=2, default=str)
+            except OperationValidationError as e:
+                logger.warning(f"Operation rejected: {e}")
+                return json.dumps({"error": str(e)})
             except Exception as e:
                 logger.error(f"Error listing directives: {e}", exc_info=True)
                 return f'{{"error": "{e}", "items": []}}'
@@ -1449,6 +1482,9 @@ def _register_list_directives(mcp: FastMCP, memory: MemoryEngine, config: MCPToo
                     request_context=_get_request_context(config),
                 )
                 return {"items": directives}
+            except OperationValidationError as e:
+                logger.warning(f"Operation rejected: {e}")
+                return {"error": str(e)}
             except Exception as e:
                 logger.error(f"Error listing directives: {e}", exc_info=True)
                 return {"error": str(e), "items": []}
@@ -1496,6 +1532,9 @@ def _register_create_directive(mcp: FastMCP, memory: MemoryEngine, config: MCPTo
                     request_context=_get_request_context(config),
                 )
                 return json.dumps(directive, indent=2, default=str)
+            except OperationValidationError as e:
+                logger.warning(f"Operation rejected: {e}")
+                return json.dumps({"error": str(e)})
             except Exception as e:
                 logger.error(f"Error creating directive: {e}", exc_info=True)
                 return f'{{"error": "{e}"}}'
@@ -1537,6 +1576,9 @@ def _register_create_directive(mcp: FastMCP, memory: MemoryEngine, config: MCPTo
                     request_context=_get_request_context(config),
                 )
                 return directive
+            except OperationValidationError as e:
+                logger.warning(f"Operation rejected: {e}")
+                return {"error": str(e)}
             except Exception as e:
                 logger.error(f"Error creating directive: {e}", exc_info=True)
                 return {"error": str(e)}
@@ -1574,6 +1616,9 @@ def _register_delete_directive(mcp: FastMCP, memory: MemoryEngine, config: MCPTo
                 if not deleted:
                     return json.dumps({"error": f"Directive '{directive_id}' not found"})
                 return json.dumps({"status": "deleted", "directive_id": directive_id})
+            except OperationValidationError as e:
+                logger.warning(f"Operation rejected: {e}")
+                return json.dumps({"error": str(e)})
             except Exception as e:
                 logger.error(f"Error deleting directive: {e}", exc_info=True)
                 return f'{{"error": "{e}"}}'
@@ -1605,6 +1650,9 @@ def _register_delete_directive(mcp: FastMCP, memory: MemoryEngine, config: MCPTo
                 if not deleted:
                     return {"error": f"Directive '{directive_id}' not found"}
                 return {"status": "deleted", "directive_id": directive_id}
+            except OperationValidationError as e:
+                logger.warning(f"Operation rejected: {e}")
+                return {"error": str(e)}
             except Exception as e:
                 logger.error(f"Error deleting directive: {e}", exc_info=True)
                 return {"error": str(e)}
@@ -1655,6 +1703,9 @@ def _register_list_memories(mcp: FastMCP, memory: MemoryEngine, config: MCPTools
                     request_context=_get_request_context(config),
                 )
                 return json.dumps(result, indent=2, default=str)
+            except OperationValidationError as e:
+                logger.warning(f"Operation rejected: {e}")
+                return json.dumps({"error": str(e)})
             except Exception as e:
                 logger.error(f"Error listing memories: {e}", exc_info=True)
                 return f'{{"error": "{e}"}}'
@@ -1694,6 +1745,9 @@ def _register_list_memories(mcp: FastMCP, memory: MemoryEngine, config: MCPTools
                     request_context=_get_request_context(config),
                 )
                 return result
+            except OperationValidationError as e:
+                logger.warning(f"Operation rejected: {e}")
+                return {"error": str(e)}
             except Exception as e:
                 logger.error(f"Error listing memories: {e}", exc_info=True)
                 return {"error": str(e)}
@@ -1731,6 +1785,9 @@ def _register_get_memory(mcp: FastMCP, memory: MemoryEngine, config: MCPToolsCon
                 if result is None:
                     return json.dumps({"error": f"Memory '{memory_id}' not found"})
                 return json.dumps(result, indent=2, default=str)
+            except OperationValidationError as e:
+                logger.warning(f"Operation rejected: {e}")
+                return json.dumps({"error": str(e)})
             except Exception as e:
                 logger.error(f"Error getting memory: {e}", exc_info=True)
                 return f'{{"error": "{e}"}}'
@@ -1762,6 +1819,9 @@ def _register_get_memory(mcp: FastMCP, memory: MemoryEngine, config: MCPToolsCon
                 if result is None:
                     return {"error": f"Memory '{memory_id}' not found"}
                 return result
+            except OperationValidationError as e:
+                logger.warning(f"Operation rejected: {e}")
+                return {"error": str(e)}
             except Exception as e:
                 logger.error(f"Error getting memory: {e}", exc_info=True)
                 return {"error": str(e)}
@@ -1796,6 +1856,9 @@ def _register_delete_memory(mcp: FastMCP, memory: MemoryEngine, config: MCPTools
                     request_context=_get_request_context(config),
                 )
                 return json.dumps({"status": "deleted", "memory_id": memory_id, **result}, default=str)
+            except OperationValidationError as e:
+                logger.warning(f"Operation rejected: {e}")
+                return json.dumps({"error": str(e)})
             except Exception as e:
                 logger.error(f"Error deleting memory: {e}", exc_info=True)
                 return f'{{"error": "{e}"}}'
@@ -1824,6 +1887,9 @@ def _register_delete_memory(mcp: FastMCP, memory: MemoryEngine, config: MCPTools
                     request_context=_get_request_context(config),
                 )
                 return {"status": "deleted", "memory_id": memory_id, **result}
+            except OperationValidationError as e:
+                logger.warning(f"Operation rejected: {e}")
+                return {"error": str(e)}
             except Exception as e:
                 logger.error(f"Error deleting memory: {e}", exc_info=True)
                 return {"error": str(e)}
@@ -1868,6 +1934,9 @@ def _register_list_documents(mcp: FastMCP, memory: MemoryEngine, config: MCPTool
                     request_context=_get_request_context(config),
                 )
                 return json.dumps(result, indent=2, default=str)
+            except OperationValidationError as e:
+                logger.warning(f"Operation rejected: {e}")
+                return json.dumps({"error": str(e)})
             except Exception as e:
                 logger.error(f"Error listing documents: {e}", exc_info=True)
                 return f'{{"error": "{e}"}}'
@@ -1901,6 +1970,9 @@ def _register_list_documents(mcp: FastMCP, memory: MemoryEngine, config: MCPTool
                     request_context=_get_request_context(config),
                 )
                 return result
+            except OperationValidationError as e:
+                logger.warning(f"Operation rejected: {e}")
+                return {"error": str(e)}
             except Exception as e:
                 logger.error(f"Error listing documents: {e}", exc_info=True)
                 return {"error": str(e)}
@@ -1938,6 +2010,9 @@ def _register_get_document(mcp: FastMCP, memory: MemoryEngine, config: MCPToolsC
                 if result is None:
                     return json.dumps({"error": f"Document '{document_id}' not found"})
                 return json.dumps(result, indent=2, default=str)
+            except OperationValidationError as e:
+                logger.warning(f"Operation rejected: {e}")
+                return json.dumps({"error": str(e)})
             except Exception as e:
                 logger.error(f"Error getting document: {e}", exc_info=True)
                 return f'{{"error": "{e}"}}'
@@ -1969,6 +2044,9 @@ def _register_get_document(mcp: FastMCP, memory: MemoryEngine, config: MCPToolsC
                 if result is None:
                     return {"error": f"Document '{document_id}' not found"}
                 return result
+            except OperationValidationError as e:
+                logger.warning(f"Operation rejected: {e}")
+                return {"error": str(e)}
             except Exception as e:
                 logger.error(f"Error getting document: {e}", exc_info=True)
                 return {"error": str(e)}
@@ -2004,6 +2082,9 @@ def _register_delete_document(mcp: FastMCP, memory: MemoryEngine, config: MCPToo
                     request_context=_get_request_context(config),
                 )
                 return json.dumps({"status": "deleted", "document_id": document_id, **result}, default=str)
+            except OperationValidationError as e:
+                logger.warning(f"Operation rejected: {e}")
+                return json.dumps({"error": str(e)})
             except Exception as e:
                 logger.error(f"Error deleting document: {e}", exc_info=True)
                 return f'{{"error": "{e}"}}'
@@ -2033,6 +2114,9 @@ def _register_delete_document(mcp: FastMCP, memory: MemoryEngine, config: MCPToo
                     request_context=_get_request_context(config),
                 )
                 return {"status": "deleted", "document_id": document_id, **result}
+            except OperationValidationError as e:
+                logger.warning(f"Operation rejected: {e}")
+                return {"error": str(e)}
             except Exception as e:
                 logger.error(f"Error deleting document: {e}", exc_info=True)
                 return {"error": str(e)}
@@ -2076,6 +2160,9 @@ def _register_list_operations(mcp: FastMCP, memory: MemoryEngine, config: MCPToo
                     request_context=_get_request_context(config),
                 )
                 return json.dumps(result, indent=2, default=str)
+            except OperationValidationError as e:
+                logger.warning(f"Operation rejected: {e}")
+                return json.dumps({"error": str(e)})
             except Exception as e:
                 logger.error(f"Error listing operations: {e}", exc_info=True)
                 return f'{{"error": "{e}"}}'
@@ -2108,6 +2195,9 @@ def _register_list_operations(mcp: FastMCP, memory: MemoryEngine, config: MCPToo
                     request_context=_get_request_context(config),
                 )
                 return result
+            except OperationValidationError as e:
+                logger.warning(f"Operation rejected: {e}")
+                return {"error": str(e)}
             except Exception as e:
                 logger.error(f"Error listing operations: {e}", exc_info=True)
                 return {"error": str(e)}
@@ -2143,6 +2233,9 @@ def _register_get_operation(mcp: FastMCP, memory: MemoryEngine, config: MCPTools
                     request_context=_get_request_context(config),
                 )
                 return json.dumps(result, indent=2, default=str)
+            except OperationValidationError as e:
+                logger.warning(f"Operation rejected: {e}")
+                return json.dumps({"error": str(e)})
             except Exception as e:
                 logger.error(f"Error getting operation: {e}", exc_info=True)
                 return f'{{"error": "{e}"}}'
@@ -2172,6 +2265,9 @@ def _register_get_operation(mcp: FastMCP, memory: MemoryEngine, config: MCPTools
                     request_context=_get_request_context(config),
                 )
                 return result
+            except OperationValidationError as e:
+                logger.warning(f"Operation rejected: {e}")
+                return {"error": str(e)}
             except Exception as e:
                 logger.error(f"Error getting operation: {e}", exc_info=True)
                 return {"error": str(e)}
@@ -2205,6 +2301,9 @@ def _register_cancel_operation(mcp: FastMCP, memory: MemoryEngine, config: MCPTo
                     request_context=_get_request_context(config),
                 )
                 return json.dumps(result, indent=2, default=str)
+            except OperationValidationError as e:
+                logger.warning(f"Operation rejected: {e}")
+                return json.dumps({"error": str(e)})
             except Exception as e:
                 logger.error(f"Error cancelling operation: {e}", exc_info=True)
                 return f'{{"error": "{e}"}}'
@@ -2232,6 +2331,9 @@ def _register_cancel_operation(mcp: FastMCP, memory: MemoryEngine, config: MCPTo
                     request_context=_get_request_context(config),
                 )
                 return result
+            except OperationValidationError as e:
+                logger.warning(f"Operation rejected: {e}")
+                return {"error": str(e)}
             except Exception as e:
                 logger.error(f"Error cancelling operation: {e}", exc_info=True)
                 return {"error": str(e)}
@@ -2275,6 +2377,9 @@ def _register_list_tags(mcp: FastMCP, memory: MemoryEngine, config: MCPToolsConf
                     request_context=_get_request_context(config),
                 )
                 return json.dumps(result, indent=2, default=str)
+            except OperationValidationError as e:
+                logger.warning(f"Operation rejected: {e}")
+                return json.dumps({"error": str(e)})
             except Exception as e:
                 logger.error(f"Error listing tags: {e}", exc_info=True)
                 return f'{{"error": "{e}"}}'
@@ -2307,6 +2412,9 @@ def _register_list_tags(mcp: FastMCP, memory: MemoryEngine, config: MCPToolsConf
                     request_context=_get_request_context(config),
                 )
                 return result
+            except OperationValidationError as e:
+                logger.warning(f"Operation rejected: {e}")
+                return {"error": str(e)}
             except Exception as e:
                 logger.error(f"Error listing tags: {e}", exc_info=True)
                 return {"error": str(e)}
@@ -2341,6 +2449,9 @@ def _register_get_bank(mcp: FastMCP, memory: MemoryEngine, config: MCPToolsConfi
                 if "disposition" in profile and hasattr(profile["disposition"], "model_dump"):
                     profile["disposition"] = profile["disposition"].model_dump()
                 return json.dumps(profile, indent=2, default=str)
+            except OperationValidationError as e:
+                logger.warning(f"Operation rejected: {e}")
+                return json.dumps({"error": str(e)})
             except Exception as e:
                 logger.error(f"Error getting bank: {e}", exc_info=True)
                 return f'{{"error": "{e}"}}'
@@ -2366,6 +2477,9 @@ def _register_get_bank(mcp: FastMCP, memory: MemoryEngine, config: MCPToolsConfi
                 if "disposition" in profile and hasattr(profile["disposition"], "model_dump"):
                     profile["disposition"] = profile["disposition"].model_dump()
                 return profile
+            except OperationValidationError as e:
+                logger.warning(f"Operation rejected: {e}")
+                return {"error": str(e)}
             except Exception as e:
                 logger.error(f"Error getting bank: {e}", exc_info=True)
                 return {"error": str(e)}
@@ -2396,6 +2510,9 @@ def _register_get_bank_stats(mcp: FastMCP, memory: MemoryEngine, config: MCPTool
                 request_context=_get_request_context(config),
             )
             return json.dumps(result, indent=2, default=str)
+        except OperationValidationError as e:
+            logger.warning(f"Operation rejected: {e}")
+            return json.dumps({"error": str(e)})
         except Exception as e:
             logger.error(f"Error getting bank stats: {e}", exc_info=True)
             return f'{{"error": "{e}"}}'
@@ -2434,6 +2551,9 @@ def _register_update_bank(mcp: FastMCP, memory: MemoryEngine, config: MCPToolsCo
                     request_context=_get_request_context(config),
                 )
                 return json.dumps(result, indent=2, default=str)
+            except OperationValidationError as e:
+                logger.warning(f"Operation rejected: {e}")
+                return json.dumps({"error": str(e)})
             except Exception as e:
                 logger.error(f"Error updating bank: {e}", exc_info=True)
                 return f'{{"error": "{e}"}}'
@@ -2466,6 +2586,9 @@ def _register_update_bank(mcp: FastMCP, memory: MemoryEngine, config: MCPToolsCo
                     request_context=_get_request_context(config),
                 )
                 return result
+            except OperationValidationError as e:
+                logger.warning(f"Operation rejected: {e}")
+                return {"error": str(e)}
             except Exception as e:
                 logger.error(f"Error updating bank: {e}", exc_info=True)
                 return {"error": str(e)}
@@ -2499,6 +2622,9 @@ def _register_delete_bank(mcp: FastMCP, memory: MemoryEngine, config: MCPToolsCo
                     request_context=_get_request_context(config),
                 )
                 return json.dumps({"status": "deleted", "bank_id": target_bank, **result}, default=str)
+            except OperationValidationError as e:
+                logger.warning(f"Operation rejected: {e}")
+                return json.dumps({"error": str(e)})
             except Exception as e:
                 logger.error(f"Error deleting bank: {e}", exc_info=True)
                 return f'{{"error": "{e}"}}'
@@ -2523,6 +2649,9 @@ def _register_delete_bank(mcp: FastMCP, memory: MemoryEngine, config: MCPToolsCo
                     request_context=_get_request_context(config),
                 )
                 return {"status": "deleted", "bank_id": target_bank, **result}
+            except OperationValidationError as e:
+                logger.warning(f"Operation rejected: {e}")
+                return {"error": str(e)}
             except Exception as e:
                 logger.error(f"Error deleting bank: {e}", exc_info=True)
                 return {"error": str(e)}
@@ -2558,6 +2687,9 @@ def _register_clear_memories(mcp: FastMCP, memory: MemoryEngine, config: MCPTool
                     request_context=_get_request_context(config),
                 )
                 return json.dumps({"status": "cleared", "bank_id": target_bank, **result}, default=str)
+            except OperationValidationError as e:
+                logger.warning(f"Operation rejected: {e}")
+                return json.dumps({"error": str(e)})
             except Exception as e:
                 logger.error(f"Error clearing memories: {e}", exc_info=True)
                 return f'{{"error": "{e}"}}'
@@ -2587,6 +2719,9 @@ def _register_clear_memories(mcp: FastMCP, memory: MemoryEngine, config: MCPTool
                     request_context=_get_request_context(config),
                 )
                 return {"status": "cleared", "bank_id": target_bank, **result}
+            except OperationValidationError as e:
+                logger.warning(f"Operation rejected: {e}")
+                return {"error": str(e)}
             except Exception as e:
                 logger.error(f"Error clearing memories: {e}", exc_info=True)
                 return {"error": str(e)}

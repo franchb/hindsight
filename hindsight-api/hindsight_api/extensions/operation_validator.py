@@ -201,6 +201,44 @@ class ConsolidateResult:
 
 
 # =============================================================================
+# Bank Management Contexts
+# =============================================================================
+
+
+@dataclass
+class BankReadContext:
+    """Context for a bank read operation validation (pre-operation)."""
+
+    bank_id: str
+    operation: str  # "get_bank_profile", "get_bank_stats"
+    request_context: "RequestContext"
+
+
+@dataclass
+class BankWriteContext:
+    """Context for a bank write operation validation (pre-operation)."""
+
+    bank_id: str
+    operation: str  # "delete_bank", "update_bank", "update_bank_disposition", "set_bank_mission", "merge_bank_mission", "clear_observations", "clear_observations_for_memory"
+    request_context: "RequestContext"
+
+
+@dataclass
+class BankListContext:
+    """Context for filtering the bank list (post-query)."""
+
+    banks: list[dict]
+    request_context: "RequestContext"
+
+
+@dataclass
+class BankListResult:
+    """Result of filtering the bank list."""
+
+    banks: list[dict]
+
+
+# =============================================================================
 # Mental Model Contexts
 # =============================================================================
 
@@ -247,6 +285,28 @@ class MentalModelRefreshResult:
     context_tokens: int  # tokens in context (if any)
     facts_used: int  # facts referenced in based_on
     mental_models_used: int  # mental models referenced in based_on
+    success: bool = True
+    error: str | None = None
+
+
+# =============================================================================
+# File Conversion Post-operation Context
+# =============================================================================
+
+
+@dataclass
+class FileConvertResult:
+    """Result context for post-file-conversion hook.
+
+    Fired after a file is converted to markdown, before the retain step.
+    """
+
+    bank_id: str
+    parser_name: str
+    filename: str
+    output_chars: int
+    output_text: str
+    request_context: "RequestContext"
     success: bool = True
     error: str | None = None
 
@@ -459,6 +519,31 @@ class OperationValidatorExtension(Extension, ABC):
         pass
 
     # =========================================================================
+    # File Conversion - Post-operation hook (optional - override to implement)
+    # =========================================================================
+
+    async def on_file_convert_complete(self, result: FileConvertResult) -> None:
+        """
+        Called after a file is converted to markdown (before the retain step).
+
+        Override to implement post-conversion logic such as:
+        - Billing for premium parsers (e.g., Iris)
+        - Usage tracking
+        - Audit logging
+
+        Args:
+            result: Result context containing:
+                - bank_id: Bank identifier
+                - parser_name: Name of the parser used (e.g., 'markitdown', 'iris')
+                - filename: Original filename
+                - output_chars: Character count of the converted markdown
+                - request_context: Request context with auth info
+                - success: Whether the conversion succeeded
+                - error: Error message (if failed)
+        """
+        pass
+
+    # =========================================================================
     # Mental Model - Pre-operation validation hook (optional - override to implement)
     # =========================================================================
 
@@ -535,3 +620,63 @@ class OperationValidatorExtension(Extension, ABC):
                 - error: Error message (if failed)
         """
         pass
+
+    # =========================================================================
+    # Bank Management - Validation hooks (optional - override to implement)
+    # =========================================================================
+
+    async def validate_bank_read(self, ctx: BankReadContext) -> ValidationResult:
+        """
+        Validate a bank read operation before execution.
+
+        Override to implement custom validation logic for bank reads
+        (get_bank_profile, get_bank_stats).
+
+        Args:
+            ctx: Context containing:
+                - bank_id: Bank identifier
+                - operation: Operation name
+                - request_context: Request context with auth info
+
+        Returns:
+            ValidationResult indicating whether the operation is allowed.
+        """
+        return ValidationResult.accept()
+
+    async def validate_bank_write(self, ctx: BankWriteContext) -> ValidationResult:
+        """
+        Validate a bank write operation before execution.
+
+        Override to implement custom validation logic for bank writes
+        (delete_bank, update_bank, update_bank_disposition, set_bank_mission,
+        merge_bank_mission, clear_observations, clear_observations_for_memory).
+
+        Args:
+            ctx: Context containing:
+                - bank_id: Bank identifier
+                - operation: Operation name
+                - request_context: Request context with auth info
+
+        Returns:
+            ValidationResult indicating whether the operation is allowed.
+        """
+        return ValidationResult.accept()
+
+    async def filter_bank_list(self, ctx: BankListContext) -> BankListResult:
+        """
+        Filter the bank list after querying.
+
+        Unlike validate_* methods, this is a post-query filter that narrows results
+        rather than a gate that blocks the operation.
+
+        Override to implement custom filtering (e.g., restrict to allowed banks).
+
+        Args:
+            ctx: Context containing:
+                - banks: List of bank dicts from the database
+                - request_context: Request context with auth info
+
+        Returns:
+            BankListResult with the filtered list of banks.
+        """
+        return BankListResult(banks=ctx.banks)

@@ -81,6 +81,7 @@ export interface MemoryItemInput {
     document_id?: string;
     entities?: EntityInput[];
     tags?: string[];
+    observation_scopes?: "per_tag" | "combined" | "all_combinations" | string[][];
 }
 
 export class HindsightClient {
@@ -188,6 +189,7 @@ export class HindsightClient {
             document_id: item.document_id,
             entities: item.entities,
             tags: item.tags,
+            observation_scopes: item.observation_scopes,
             timestamp:
                 item.timestamp instanceof Date
                     ? item.timestamp.toISOString()
@@ -284,7 +286,7 @@ export class HindsightClient {
                 trace: options?.trace,
                 query_timestamp: options?.queryTimestamp,
                 include: {
-                    entities: options?.includeEntities ? { max_tokens: options?.maxEntityTokens ?? 500 } : undefined,
+                    entities: options?.includeEntities === false ? null : options?.includeEntities ? { max_tokens: options?.maxEntityTokens ?? 500 } : undefined,
                     chunks: options?.includeChunks ? { max_tokens: options?.maxChunkTokens ?? 8192 } : undefined,
                     source_facts: options?.includeSourceFacts ? { max_tokens: options?.maxSourceFactsTokens ?? 4096 } : undefined,
                 },

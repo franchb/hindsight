@@ -8,6 +8,83 @@ This changelog highlights user-facing changes only. Internal maintenance, CI/CD,
 
 For full release details, see [GitHub Releases](https://github.com/vectorize-io/hindsight/releases).
 
+## [0.4.16](https://github.com/vectorize-io/hindsight/releases/tag/v0.4.16)
+
+**Features**
+
+- Added Webhooks with `consolidation.completed` and `retain.completed` events. ([`abbf874d`](https://github.com/vectorize-io/hindsight/commit/abbf874d))
+
+**Improvements**
+
+- Improved OpenClaw recall/retention controls. ([`d425e93c`](https://github.com/vectorize-io/hindsight/commit/d425e93c))
+- Improved search/reranking quality by switching combined scoring to multiplicative boosts. ([`aa8e5475`](https://github.com/vectorize-io/hindsight/commit/aa8e5475))
+- Improved performance of observation recall by 40x on large banks. ([`ad2cf72a`](https://github.com/vectorize-io/hindsight/commit/ad2cf72a))
+- Improved server shutdown behavior by capping graceful shutdown time and allowing a forced kill on a second Ctrl+C. ([`4c058b4b`](https://github.com/vectorize-io/hindsight/commit/4c058b4b))
+
+**Bug Fixes**
+
+- Fixed an async deadlock risk by running database schema migrations in a background thread during startup. ([`e0a2ac63`](https://github.com/vectorize-io/hindsight/commit/e0a2ac63))
+- Fixed webhook delivery/outbox processing so transactions don’t silently roll back due to using the wrong database schema name. ([`75b95106`](https://github.com/vectorize-io/hindsight/commit/75b95106))
+- Fixed observation results to correctly resolve and return related chunks using source_memory_ids. ([`cb6d1c46`](https://github.com/vectorize-io/hindsight/commit/cb6d1c46))
+- Fixed MCP bank-level tool filtering compatibility with FastMCP 3.x. ([`f17406fd`](https://github.com/vectorize-io/hindsight/commit/f17406fd))
+- Fixed crashes when an LLM returns invalid JSON across all retries (now handled cleanly instead of raising a TypeError). ([`66423b85`](https://github.com/vectorize-io/hindsight/commit/66423b85))
+- Fixed observations without source dates to preserve missing (None) temporal fields instead of incorrectly populating them. ([`891c33b1`](https://github.com/vectorize-io/hindsight/commit/891c33b1))
+
+## [0.4.15](https://github.com/vectorize-io/hindsight/releases/tag/v0.4.15)
+
+**Features**
+
+- Added observation_scopes to control the granularity/visibility of observations. ([`55af4681`](https://github.com/vectorize-io/hindsight/commit/55af4681))
+- List documents API now supports filtering by tags (and fixes the q parameter description). ([`1d70abfe`](https://github.com/vectorize-io/hindsight/commit/1d70abfe))
+- Added PydanticAI integration for persistent agent memory. ([`cab5a40f`](https://github.com/vectorize-io/hindsight/commit/cab5a40f))
+- Added richer entity label support (optional labels, free-form values, multi-value fields, and UI polish). ([`9b96becc`](https://github.com/vectorize-io/hindsight/commit/9b96becc))
+- Added support for timestamp="unset" so content can be retained without a date. ([`f903948a`](https://github.com/vectorize-io/hindsight/commit/f903948a))
+- OpenClaw can now automatically retain the last n+2 turns every n turns (default n=10). ([`ad1660b3`](https://github.com/vectorize-io/hindsight/commit/ad1660b3))
+- Added configurable Gemini/Vertex AI safety settings for LLM calls. ([`73ef99e7`](https://github.com/vectorize-io/hindsight/commit/73ef99e7))
+- Added extension hooks to customize root routing and error headers. ([`e407f4bc`](https://github.com/vectorize-io/hindsight/commit/e407f4bc))
+
+**Improvements**
+
+- Improved recall performance by fetching all recall chunks in a single query. ([`61bf428b`](https://github.com/vectorize-io/hindsight/commit/61bf428b))
+- Improved recall/retain performance and scalability for large memory banks. ([`7942f181`](https://github.com/vectorize-io/hindsight/commit/7942f181))
+
+**Bug Fixes**
+
+- Fixed the TypeScript SDK to send null (not undefined) when includeEntities is false. ([`15f4b876`](https://github.com/vectorize-io/hindsight/commit/15f4b876))
+- Prevented reflect from failing with context_length_exceeded on large memory banks. ([`77defd96`](https://github.com/vectorize-io/hindsight/commit/77defd96))
+- Fixed a consolidation deadlock caused by retrying after zombie processing tasks. ([`c2876490`](https://github.com/vectorize-io/hindsight/commit/c2876490))
+- Fixed observations count in the control plane that always showed 0. ([`eaeaa1f2`](https://github.com/vectorize-io/hindsight/commit/eaeaa1f2))
+- Fixed ZeroEntropy rerank endpoint URL and ensured the MCP retain async_processing parameter is handled correctly. ([`f6f1a7d8`](https://github.com/vectorize-io/hindsight/commit/f6f1a7d8))
+- Fixed JSON serialization issues and logging-related exception propagation when using the claude_code LLM provider. ([`ecb833f4`](https://github.com/vectorize-io/hindsight/commit/ecb833f4))
+- Added bank-scoped request validation to prevent cross-bank/invalid bank operations. ([`5270aa5a`](https://github.com/vectorize-io/hindsight/commit/5270aa5a))
+
+## [0.4.14](https://github.com/vectorize-io/hindsight/releases/tag/v0.4.14)
+
+**Features**
+
+- Add Chat SDK integration to give chatbots persistent memory. ([`fed987f9`](https://github.com/vectorize-io/hindsight/commit/fed987f9))
+- Allow configuring which MCP tools are exposed per memory bank, and expand the MCP tool set with additional tools and parameters. ([`3ffec650`](https://github.com/vectorize-io/hindsight/commit/3ffec650))
+- Enable the bank configuration API by default. ([`4d030707`](https://github.com/vectorize-io/hindsight/commit/4d030707))
+- Support filtering graph-based memory retrieval by tags. ([`0bb5ca4c`](https://github.com/vectorize-io/hindsight/commit/0bb5ca4c))
+- Add batch observations consolidation to process multiple observations more efficiently. ([`0aa7c2b3`](https://github.com/vectorize-io/hindsight/commit/0aa7c2b3))
+- Add OpenClaw options to toggle autoRecall and exclude specific providers. ([`3f9eb27c`](https://github.com/vectorize-io/hindsight/commit/3f9eb27c))
+- Add a ZeroEntropy reranker provider option. ([`17259675`](https://github.com/vectorize-io/hindsight/commit/17259675))
+
+**Improvements**
+
+- Increase customization options for reflect, retain, and consolidation behavior. ([`2a322732`](https://github.com/vectorize-io/hindsight/commit/2a322732))
+- Include source document metadata in fact extraction results. ([`87219b73`](https://github.com/vectorize-io/hindsight/commit/87219b73))
+
+**Bug Fixes**
+
+- Raise a clear error when embedding dimensions exceed pgvector HNSW limits (instead of failing later at runtime). ([`8cd65b98`](https://github.com/vectorize-io/hindsight/commit/8cd65b98))
+- Fix multi-tenant schema isolation issues in storage and the bank config API. ([`b180b3ad`](https://github.com/vectorize-io/hindsight/commit/b180b3ad))
+- Ensure LiteLLM embedding calls use the correct float encoding format to prevent embedding failures. ([`58f2de70`](https://github.com/vectorize-io/hindsight/commit/58f2de70))
+- Improve recall performance by reducing memory usage during retrieval. ([`9f0c031d`](https://github.com/vectorize-io/hindsight/commit/9f0c031d))
+- Handle observation regeneration correctly when underlying memories are deleted. ([`ac9a94ad`](https://github.com/vectorize-io/hindsight/commit/ac9a94ad))
+- Fix reflect retrieval to correctly populate dependencies and enforce full hierarchical retrieval. ([`8b1a4658`](https://github.com/vectorize-io/hindsight/commit/8b1a4658))
+- Fix OpenClaw health checks by passing the auth token to the health endpoint. ([`40b02645`](https://github.com/vectorize-io/hindsight/commit/40b02645))
+
 ## [0.4.13](https://github.com/vectorize-io/hindsight/releases/tag/v0.4.13)
 
 **Features**

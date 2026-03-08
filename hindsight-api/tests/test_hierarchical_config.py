@@ -75,14 +75,21 @@ async def test_hierarchical_fields_categorization():
     assert "retain_custom_instructions" in configurable
     assert "retain_chunk_size" in configurable
     assert "enable_observations" in configurable
+    assert "consolidation_llm_batch_size" in configurable
+    assert "consolidation_source_facts_max_tokens" in configurable
+    assert "consolidation_source_facts_max_tokens_per_observation" in configurable
     assert "observations_mission" in configurable
     assert "reflect_mission" in configurable
     assert "disposition_skepticism" in configurable
     assert "disposition_literalism" in configurable
     assert "disposition_empathy" in configurable
 
+    # Verify entity labels fields are included
+    assert "entities_allow_free_form" in configurable
+    assert "entity_labels" in configurable
+
     # Verify count is correct
-    assert len(configurable) == 11
+    assert len(configurable) == 17
 
     # Verify credential fields (NEVER exposed)
     assert "llm_api_key" in credentials

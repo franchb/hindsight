@@ -180,16 +180,19 @@ class Hindsight:
             RetainResponse with success status and item count
         """
         from hindsight_client_api.models.entity_input import EntityInput
+        from hindsight_client_api.models.timestamp import Timestamp
 
         memory_items = []
         for item in items:
             entities = None
             if item.get("entities"):
                 entities = [EntityInput(text=e["text"], type=e.get("type")) for e in item["entities"]]
+            raw_ts = item.get("timestamp")
+            timestamp_val = Timestamp(actual_instance=raw_ts) if raw_ts is not None else None
             memory_items.append(
                 memory_item.MemoryItem(
                     content=item["content"],
-                    timestamp=item.get("timestamp"),
+                    timestamp=timestamp_val,
                     context=item.get("context"),
                     metadata=item.get("metadata"),
                     # Use item's document_id if provided, otherwise fall back to batch-level document_id
@@ -591,16 +594,19 @@ class Hindsight:
             RetainResponse with success status and item count
         """
         from hindsight_client_api.models.entity_input import EntityInput
+        from hindsight_client_api.models.timestamp import Timestamp
 
         memory_items = []
         for item in items:
             entities = None
             if item.get("entities"):
                 entities = [EntityInput(text=e["text"], type=e.get("type")) for e in item["entities"]]
+            raw_ts = item.get("timestamp")
+            timestamp_val = Timestamp(actual_instance=raw_ts) if raw_ts is not None else None
             memory_items.append(
                 memory_item.MemoryItem(
                     content=item["content"],
-                    timestamp=item.get("timestamp"),
+                    timestamp=timestamp_val,
                     context=item.get("context"),
                     metadata=item.get("metadata"),
                     # Use item's document_id if provided, otherwise fall back to batch-level document_id
@@ -906,6 +912,19 @@ class Hindsight:
             mental_model_id: The mental model ID
         """
         return _run_async(self._mental_models_api.delete_mental_model(bank_id, mental_model_id, _request_timeout=self._timeout))
+
+    def get_mental_model_history(self, bank_id: str, mental_model_id: str):
+        """
+        Get the content change history of a mental model.
+
+        Returns a list of history entries (most recent first), each with
+        ``previous_content`` and ``changed_at`` fields.
+
+        Args:
+            bank_id: The memory bank ID
+            mental_model_id: The mental model ID
+        """
+        return _run_async(self._mental_models_api.get_mental_model_history(bank_id, mental_model_id, _request_timeout=self._timeout))
 
     # Directives methods
 

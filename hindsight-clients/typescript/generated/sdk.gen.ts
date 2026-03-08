@@ -32,6 +32,9 @@ import type {
   CreateOrUpdateBankData,
   CreateOrUpdateBankErrors,
   CreateOrUpdateBankResponses,
+  CreateWebhookData,
+  CreateWebhookErrors,
+  CreateWebhookResponses,
   DeleteBankData,
   DeleteBankErrors,
   DeleteBankResponses,
@@ -44,6 +47,9 @@ import type {
   DeleteMentalModelData,
   DeleteMentalModelErrors,
   DeleteMentalModelResponses,
+  DeleteWebhookData,
+  DeleteWebhookErrors,
+  DeleteWebhookResponses,
   FileRetainData,
   FileRetainErrors,
   FileRetainResponses,
@@ -76,7 +82,13 @@ import type {
   GetMemoryResponses,
   GetMentalModelData,
   GetMentalModelErrors,
+  GetMentalModelHistoryData,
+  GetMentalModelHistoryErrors,
+  GetMentalModelHistoryResponses,
   GetMentalModelResponses,
+  GetObservationHistoryData,
+  GetObservationHistoryErrors,
+  GetObservationHistoryResponses,
   GetOperationStatusData,
   GetOperationStatusErrors,
   GetOperationStatusResponses,
@@ -108,6 +120,12 @@ import type {
   ListTagsData,
   ListTagsErrors,
   ListTagsResponses,
+  ListWebhookDeliveriesData,
+  ListWebhookDeliveriesErrors,
+  ListWebhookDeliveriesResponses,
+  ListWebhooksData,
+  ListWebhooksErrors,
+  ListWebhooksResponses,
   MetricsEndpointMetricsGetData,
   MetricsEndpointMetricsGetResponses,
   RecallMemoriesData,
@@ -143,9 +161,15 @@ import type {
   UpdateDirectiveData,
   UpdateDirectiveErrors,
   UpdateDirectiveResponses,
+  UpdateDocumentData,
+  UpdateDocumentErrors,
+  UpdateDocumentResponses,
   UpdateMentalModelData,
   UpdateMentalModelErrors,
   UpdateMentalModelResponses,
+  UpdateWebhookData,
+  UpdateWebhookErrors,
+  UpdateWebhookResponses,
 } from "./types.gen";
 
 export type Options<
@@ -237,7 +261,7 @@ export const listMemories = <ThrowOnError extends boolean = false>(
 /**
  * Get memory unit
  *
- * Get a single memory unit by ID with all its metadata including entities and tags.
+ * Get a single memory unit by ID with all its metadata including entities and tags. Note: the 'history' field is deprecated and always returns an empty list - use GET /memories/{memory_id}/history instead.
  */
 export const getMemory = <ThrowOnError extends boolean = false>(
   options: Options<GetMemoryData, ThrowOnError>,
@@ -247,6 +271,23 @@ export const getMemory = <ThrowOnError extends boolean = false>(
     GetMemoryErrors,
     ThrowOnError
   >({ url: "/v1/default/banks/{bank_id}/memories/{memory_id}", ...options });
+
+/**
+ * Get observation history
+ *
+ * Get the full history of an observation, with each change's source facts resolved to their text.
+ */
+export const getObservationHistory = <ThrowOnError extends boolean = false>(
+  options: Options<GetObservationHistoryData, ThrowOnError>,
+) =>
+  (options.client ?? client).get<
+    GetObservationHistoryResponses,
+    GetObservationHistoryErrors,
+    ThrowOnError
+  >({
+    url: "/v1/default/banks/{bank_id}/memories/{memory_id}/history",
+    ...options,
+  });
 
 /**
  * Recall memory
@@ -469,6 +510,23 @@ export const updateMentalModel = <ThrowOnError extends boolean = false>(
   });
 
 /**
+ * Get mental model history
+ *
+ * Get the refresh history of a mental model, showing content changes over time.
+ */
+export const getMentalModelHistory = <ThrowOnError extends boolean = false>(
+  options: Options<GetMentalModelHistoryData, ThrowOnError>,
+) =>
+  (options.client ?? client).get<
+    GetMentalModelHistoryResponses,
+    GetMentalModelHistoryErrors,
+    ThrowOnError
+  >({
+    url: "/v1/default/banks/{bank_id}/mental-models/{mental_model_id}/history",
+    ...options,
+  });
+
+/**
  * Refresh mental model
  *
  * Submit an async task to re-run the source query through reflect and update the content.
@@ -623,6 +681,31 @@ export const getDocument = <ThrowOnError extends boolean = false>(
     GetDocumentErrors,
     ThrowOnError
   >({ url: "/v1/default/banks/{bank_id}/documents/{document_id}", ...options });
+
+/**
+ * Update document
+ *
+ * Update mutable fields on a document without re-processing its content.
+ *
+ * **Tags** (`tags`): Propagated to all associated memory units. Observations derived from those units are invalidated and queued for re-consolidation under the new tags. Co-source memories from other documents that shared those observations are also reset.
+ *
+ * At least one field must be provided.
+ */
+export const updateDocument = <ThrowOnError extends boolean = false>(
+  options: Options<UpdateDocumentData, ThrowOnError>,
+) =>
+  (options.client ?? client).patch<
+    UpdateDocumentResponses,
+    UpdateDocumentErrors,
+    ThrowOnError
+  >({
+    url: "/v1/default/banks/{bank_id}/documents/{document_id}",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
 
 /**
  * List tags
@@ -913,6 +996,93 @@ export const triggerConsolidation = <ThrowOnError extends boolean = false>(
   >({ url: "/v1/default/banks/{bank_id}/consolidate", ...options });
 
 /**
+ * List webhooks
+ *
+ * List all webhooks registered for a bank.
+ */
+export const listWebhooks = <ThrowOnError extends boolean = false>(
+  options: Options<ListWebhooksData, ThrowOnError>,
+) =>
+  (options.client ?? client).get<
+    ListWebhooksResponses,
+    ListWebhooksErrors,
+    ThrowOnError
+  >({ url: "/v1/default/banks/{bank_id}/webhooks", ...options });
+
+/**
+ * Register webhook
+ *
+ * Register a webhook endpoint to receive event notifications for this bank.
+ */
+export const createWebhook = <ThrowOnError extends boolean = false>(
+  options: Options<CreateWebhookData, ThrowOnError>,
+) =>
+  (options.client ?? client).post<
+    CreateWebhookResponses,
+    CreateWebhookErrors,
+    ThrowOnError
+  >({
+    url: "/v1/default/banks/{bank_id}/webhooks",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+/**
+ * Delete webhook
+ *
+ * Remove a registered webhook.
+ */
+export const deleteWebhook = <ThrowOnError extends boolean = false>(
+  options: Options<DeleteWebhookData, ThrowOnError>,
+) =>
+  (options.client ?? client).delete<
+    DeleteWebhookResponses,
+    DeleteWebhookErrors,
+    ThrowOnError
+  >({ url: "/v1/default/banks/{bank_id}/webhooks/{webhook_id}", ...options });
+
+/**
+ * Update webhook
+ *
+ * Update one or more fields of a registered webhook. Only provided fields are changed.
+ */
+export const updateWebhook = <ThrowOnError extends boolean = false>(
+  options: Options<UpdateWebhookData, ThrowOnError>,
+) =>
+  (options.client ?? client).patch<
+    UpdateWebhookResponses,
+    UpdateWebhookErrors,
+    ThrowOnError
+  >({
+    url: "/v1/default/banks/{bank_id}/webhooks/{webhook_id}",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+/**
+ * List webhook deliveries
+ *
+ * Inspect delivery history for a webhook (useful for debugging).
+ */
+export const listWebhookDeliveries = <ThrowOnError extends boolean = false>(
+  options: Options<ListWebhookDeliveriesData, ThrowOnError>,
+) =>
+  (options.client ?? client).get<
+    ListWebhookDeliveriesResponses,
+    ListWebhookDeliveriesErrors,
+    ThrowOnError
+  >({
+    url: "/v1/default/banks/{bank_id}/webhooks/{webhook_id}/deliveries",
+    ...options,
+  });
+
+/**
  * Clear memory bank memories
  *
  * Delete memory units for a memory bank. Optionally filter by type (world, experience, opinion) to delete only specific types. This is a destructive operation that cannot be undone. The bank profile (disposition and background) will be preserved.
@@ -994,9 +1164,14 @@ export const retainMemories = <ThrowOnError extends boolean = false>(
  *
  * **Request format:** multipart/form-data with:
  * - `files`: One or more files to upload
- * - `request`: JSON string with FileRetainRequest model (files_metadata)
+ * - `request`: JSON string with FileRetainRequest model
  *
- * **Note:** File parser is configured server-side via `HINDSIGHT_API_FILE_PARSER` (default: markitdown).
+ * **Parser selection:**
+ * - Set `parser` in the request body to override the server default for all files.
+ * - Set `parser` inside a `files_metadata` entry for per-file control.
+ * - Pass a list (e.g. `['iris', 'markitdown']`) to define an ordered fallback chain — each parser is tried in sequence until one succeeds.
+ * - Falls back to the server default (`HINDSIGHT_API_FILE_PARSER`) if not specified.
+ * - Only parsers enabled on the server may be requested; others return HTTP 400.
  */
 export const fileRetain = <ThrowOnError extends boolean = false>(
   options: Options<FileRetainData, ThrowOnError>,

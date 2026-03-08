@@ -171,6 +171,7 @@ def main():
             llm_vertexai_project_id=config.llm_vertexai_project_id,
             llm_vertexai_region=config.llm_vertexai_region,
             llm_vertexai_service_account_key=config.llm_vertexai_service_account_key,
+            llm_gemini_safety_settings=config.llm_gemini_safety_settings,
             retain_llm_provider=config.retain_llm_provider,
             retain_llm_api_key=config.retain_llm_api_key,
             retain_llm_model=config.retain_llm_model,
@@ -252,6 +253,7 @@ def main():
             retain_mission=config.retain_mission,
             retain_custom_instructions=config.retain_custom_instructions,
             retain_batch_tokens=config.retain_batch_tokens,
+            retain_entity_lookup=config.retain_entity_lookup,
             retain_batch_enabled=config.retain_batch_enabled,
             retain_batch_poll_interval_seconds=config.retain_batch_poll_interval_seconds,
             file_storage_type=config.file_storage_type,
@@ -266,6 +268,7 @@ def main():
             file_storage_azure_account_name=config.file_storage_azure_account_name,
             file_storage_azure_account_key=config.file_storage_azure_account_key,
             file_parser=config.file_parser,
+            file_parser_allowlist=config.file_parser_allowlist,
             file_parser_iris_token=config.file_parser_iris_token,
             file_parser_iris_org_id=config.file_parser_iris_org_id,
             file_conversion_max_batch_size_mb=config.file_conversion_max_batch_size_mb,
@@ -273,10 +276,16 @@ def main():
             enable_file_upload_api=config.enable_file_upload_api,
             file_delete_after_retain=config.file_delete_after_retain,
             enable_observations=config.enable_observations,
+            enable_observation_history=config.enable_observation_history,
+            enable_mental_model_history=config.enable_mental_model_history,
             consolidation_batch_size=config.consolidation_batch_size,
             consolidation_llm_batch_size=config.consolidation_llm_batch_size,
             consolidation_max_tokens=config.consolidation_max_tokens,
+            consolidation_source_facts_max_tokens=config.consolidation_source_facts_max_tokens,
+            consolidation_source_facts_max_tokens_per_observation=config.consolidation_source_facts_max_tokens_per_observation,
             observations_mission=config.observations_mission,
+            entity_labels=config.entity_labels,
+            entities_allow_free_form=config.entities_allow_free_form,
             skip_llm_verification=config.skip_llm_verification,
             lazy_reranker=config.lazy_reranker,
             run_migrations_on_startup=config.run_migrations_on_startup,
@@ -292,6 +301,7 @@ def main():
             worker_max_slots=config.worker_max_slots,
             worker_consolidation_max_slots=config.worker_consolidation_max_slots,
             reflect_max_iterations=config.reflect_max_iterations,
+            reflect_max_context_tokens=config.reflect_max_context_tokens,
             reflect_mission=config.reflect_mission,
             disposition_skepticism=config.disposition_skepticism,
             disposition_literalism=config.disposition_literalism,
@@ -302,6 +312,10 @@ def main():
             otel_exporter_otlp_headers=config.otel_exporter_otlp_headers,
             otel_service_name=config.otel_service_name,
             otel_deployment_environment=config.otel_deployment_environment,
+            webhook_url=config.webhook_url,
+            webhook_secret=config.webhook_secret,
+            webhook_event_types=config.webhook_event_types,
+            webhook_delivery_poll_interval_seconds=config.webhook_delivery_poll_interval_seconds,
         )
     config.configure_logging()
     if not args.daemon:
@@ -380,6 +394,7 @@ def main():
         "ws": "wsproto",  # Use wsproto instead of websockets to avoid deprecation warnings
         "loop": loop_impl,  # Explicitly set event loop implementation
         "timeout_keep_alive": 30,  # Exceed aiohttp's 15s client timeout so the client always closes first
+        "timeout_graceful_shutdown": 5,  # Cap graceful shutdown at 5s; also enables force-kill on second Ctrl+C
     }
 
     # Add optional parameters if provided

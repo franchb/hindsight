@@ -252,6 +252,9 @@ ENV_LLM_VERTEXAI_PROJECT_ID = "HINDSIGHT_API_LLM_VERTEXAI_PROJECT_ID"
 ENV_LLM_VERTEXAI_REGION = "HINDSIGHT_API_LLM_VERTEXAI_REGION"
 ENV_LLM_VERTEXAI_SERVICE_ACCOUNT_KEY = "HINDSIGHT_API_LLM_VERTEXAI_SERVICE_ACCOUNT_KEY"
 
+# Gemini safety settings
+ENV_LLM_GEMINI_SAFETY_SETTINGS = "HINDSIGHT_API_LLM_GEMINI_SAFETY_SETTINGS"
+
 # Retain settings
 ENV_RETAIN_MAX_COMPLETION_TOKENS = "HINDSIGHT_API_RETAIN_MAX_COMPLETION_TOKENS"
 ENV_RETAIN_CHUNK_SIZE = "HINDSIGHT_API_RETAIN_CHUNK_SIZE"
@@ -260,6 +263,7 @@ ENV_RETAIN_EXTRACTION_MODE = "HINDSIGHT_API_RETAIN_EXTRACTION_MODE"
 ENV_RETAIN_MISSION = "HINDSIGHT_API_RETAIN_MISSION"
 ENV_RETAIN_CUSTOM_INSTRUCTIONS = "HINDSIGHT_API_RETAIN_CUSTOM_INSTRUCTIONS"
 ENV_RETAIN_BATCH_TOKENS = "HINDSIGHT_API_RETAIN_BATCH_TOKENS"
+ENV_RETAIN_ENTITY_LOOKUP = "HINDSIGHT_API_RETAIN_ENTITY_LOOKUP"
 ENV_RETAIN_BATCH_ENABLED = "HINDSIGHT_API_RETAIN_BATCH_ENABLED"
 ENV_RETAIN_BATCH_POLL_INTERVAL_SECONDS = "HINDSIGHT_API_RETAIN_BATCH_POLL_INTERVAL_SECONDS"
 
@@ -276,6 +280,7 @@ ENV_FILE_STORAGE_AZURE_CONTAINER = "HINDSIGHT_API_FILE_STORAGE_AZURE_CONTAINER"
 ENV_FILE_STORAGE_AZURE_ACCOUNT_NAME = "HINDSIGHT_API_FILE_STORAGE_AZURE_ACCOUNT_NAME"
 ENV_FILE_STORAGE_AZURE_ACCOUNT_KEY = "HINDSIGHT_API_FILE_STORAGE_AZURE_ACCOUNT_KEY"
 ENV_FILE_PARSER = "HINDSIGHT_API_FILE_PARSER"
+ENV_FILE_PARSER_ALLOWLIST = "HINDSIGHT_API_FILE_PARSER_ALLOWLIST"
 ENV_FILE_PARSER_IRIS_TOKEN = "HINDSIGHT_API_FILE_PARSER_IRIS_TOKEN"
 ENV_FILE_PARSER_IRIS_ORG_ID = "HINDSIGHT_API_FILE_PARSER_IRIS_ORG_ID"
 ENV_FILE_CONVERSION_MAX_BATCH_SIZE_MB = "HINDSIGHT_API_FILE_CONVERSION_MAX_BATCH_SIZE_MB"
@@ -288,7 +293,19 @@ ENV_ENABLE_OBSERVATIONS = "HINDSIGHT_API_ENABLE_OBSERVATIONS"
 ENV_CONSOLIDATION_BATCH_SIZE = "HINDSIGHT_API_CONSOLIDATION_BATCH_SIZE"
 ENV_CONSOLIDATION_LLM_BATCH_SIZE = "HINDSIGHT_API_CONSOLIDATION_LLM_BATCH_SIZE"
 ENV_CONSOLIDATION_MAX_TOKENS = "HINDSIGHT_API_CONSOLIDATION_MAX_TOKENS"
+ENV_CONSOLIDATION_SOURCE_FACTS_MAX_TOKENS = "HINDSIGHT_API_CONSOLIDATION_SOURCE_FACTS_MAX_TOKENS"
+ENV_CONSOLIDATION_SOURCE_FACTS_MAX_TOKENS_PER_OBSERVATION = (
+    "HINDSIGHT_API_CONSOLIDATION_SOURCE_FACTS_MAX_TOKENS_PER_OBSERVATION"
+)
 ENV_OBSERVATIONS_MISSION = "HINDSIGHT_API_OBSERVATIONS_MISSION"
+ENV_ENABLE_OBSERVATION_HISTORY = "HINDSIGHT_API_ENABLE_OBSERVATION_HISTORY"
+ENV_ENABLE_MENTAL_MODEL_HISTORY = "HINDSIGHT_API_ENABLE_MENTAL_MODEL_HISTORY"
+
+# Webhook configuration (global, static - server-level only)
+ENV_WEBHOOK_URL = "HINDSIGHT_API_WEBHOOK_URL"
+ENV_WEBHOOK_SECRET = "HINDSIGHT_API_WEBHOOK_SECRET"
+ENV_WEBHOOK_EVENT_TYPES = "HINDSIGHT_API_WEBHOOK_EVENT_TYPES"
+ENV_WEBHOOK_DELIVERY_POLL_INTERVAL_SECONDS = "HINDSIGHT_API_WEBHOOK_DELIVERY_POLL_INTERVAL_SECONDS"
 
 # Optimization flags
 ENV_SKIP_LLM_VERIFICATION = "HINDSIGHT_API_SKIP_LLM_VERIFICATION"
@@ -314,6 +331,7 @@ ENV_WORKER_CONSOLIDATION_MAX_SLOTS = "HINDSIGHT_API_WORKER_CONSOLIDATION_MAX_SLO
 
 # Reflect agent settings
 ENV_REFLECT_MAX_ITERATIONS = "HINDSIGHT_API_REFLECT_MAX_ITERATIONS"
+ENV_REFLECT_MAX_CONTEXT_TOKENS = "HINDSIGHT_API_REFLECT_MAX_CONTEXT_TOKENS"
 ENV_REFLECT_MISSION = "HINDSIGHT_API_REFLECT_MISSION"
 
 # Disposition settings
@@ -350,6 +368,9 @@ DEFAULT_LLM_TIMEOUT = 120.0  # seconds
 DEFAULT_LLM_VERTEXAI_PROJECT_ID = None  # Required for Vertex AI
 DEFAULT_LLM_VERTEXAI_REGION = "us-central1"
 DEFAULT_LLM_VERTEXAI_SERVICE_ACCOUNT_KEY = None  # Optional, uses ADC if not set
+
+# Gemini safety settings defaults
+DEFAULT_LLM_GEMINI_SAFETY_SETTINGS = None  # None = use Gemini default safety settings
 
 DEFAULT_EMBEDDINGS_PROVIDER = "local"
 DEFAULT_EMBEDDINGS_LOCAL_MODEL = "BAAI/bge-small-en-v1.5"
@@ -415,12 +436,14 @@ RETAIN_EXTRACTION_MODES = ("concise", "verbose", "custom")  # Allowed extraction
 DEFAULT_RETAIN_MISSION = None  # Declarative spec of what to retain (injected into any extraction mode)
 DEFAULT_RETAIN_CUSTOM_INSTRUCTIONS = None  # Custom extraction guidelines (only used when mode="custom")
 DEFAULT_RETAIN_BATCH_TOKENS = 10_000  # ~40KB of text  # Max chars per sub-batch for async retain auto-splitting
+DEFAULT_RETAIN_ENTITY_LOOKUP = "trigram"  # "full" or "trigram"
 DEFAULT_RETAIN_BATCH_ENABLED = False  # Use LLM Batch API for fact extraction (only when async=True)
 DEFAULT_RETAIN_BATCH_POLL_INTERVAL_SECONDS = 60  # Batch API polling interval in seconds
 
 # File storage defaults
 DEFAULT_FILE_STORAGE_TYPE = "native"  # PostgreSQL BYTEA storage
-DEFAULT_FILE_PARSER = "markitdown"  # File parser to use (markitdown is the only supported parser)
+DEFAULT_FILE_PARSER = "markitdown"  # Default parser fallback chain (comma-separated, e.g. "iris,markitdown")
+DEFAULT_FILE_PARSER_ALLOWLIST = None  # Allowlist of parsers clients may request (None = all registered parsers)
 DEFAULT_FILE_CONVERSION_MAX_BATCH_SIZE_MB = 100  # Max total batch size in MB (all files combined)
 DEFAULT_FILE_CONVERSION_MAX_BATCH_SIZE = 10  # Max files per batch upload
 DEFAULT_ENABLE_FILE_UPLOAD_API = True  # Enable file upload endpoint
@@ -428,9 +451,17 @@ DEFAULT_FILE_DELETE_AFTER_RETAIN = True  # Delete file bytes after retain (saves
 
 # Observations defaults (consolidated knowledge from facts)
 DEFAULT_ENABLE_OBSERVATIONS = True  # Observations enabled by default
+DEFAULT_ENABLE_OBSERVATION_HISTORY = True  # Observation history tracking enabled by default
+DEFAULT_ENABLE_MENTAL_MODEL_HISTORY = True  # Mental model history tracking enabled by default
 DEFAULT_CONSOLIDATION_BATCH_SIZE = 50  # Memories to load per batch (internal memory optimization)
 DEFAULT_CONSOLIDATION_LLM_BATCH_SIZE = 8  # Facts per LLM call (1 = no batching; >1 = batch mode)
 DEFAULT_CONSOLIDATION_MAX_TOKENS = 512  # Max tokens for recall when finding related observations
+DEFAULT_CONSOLIDATION_SOURCE_FACTS_MAX_TOKENS = (
+    -1
+)  # Total token budget for source facts in consolidation recall (-1 = unlimited)
+DEFAULT_CONSOLIDATION_SOURCE_FACTS_MAX_TOKENS_PER_OBSERVATION = (
+    256  # Max tokens of source facts per observation in consolidation prompt (-1 = unlimited)
+)
 DEFAULT_OBSERVATIONS_MISSION = None  # Declarative spec of what observations are for this bank
 
 # Database migrations
@@ -453,6 +484,7 @@ DEFAULT_WORKER_CONSOLIDATION_MAX_SLOTS = 2  # Max concurrent consolidation tasks
 
 # Reflect agent settings
 DEFAULT_REFLECT_MAX_ITERATIONS = 10  # Max tool call iterations before forcing response
+DEFAULT_REFLECT_MAX_CONTEXT_TOKENS = 100_000  # Max accumulated context tokens before forcing final prompt
 
 # Disposition defaults (None = not set, fall back to bank DB value or 3)
 DEFAULT_DISPOSITION_SKEPTICISM = None
@@ -487,6 +519,12 @@ Use this tool PROACTIVELY to:
 # Default embedding dimension (used by initial migration, adjusted at runtime)
 EMBEDDING_DIMENSION = DEFAULT_EMBEDDING_DIMENSION
 
+# Webhook configuration defaults
+DEFAULT_WEBHOOK_URL = None  # None = no global webhook configured
+DEFAULT_WEBHOOK_SECRET = None  # None = no signing
+DEFAULT_WEBHOOK_EVENT_TYPES = "consolidation.completed"  # Comma-separated; default = all supported events
+DEFAULT_WEBHOOK_DELIVERY_POLL_INTERVAL_SECONDS = 30  # How often to poll for pending deliveries
+
 
 class JsonFormatter(logging.Formatter):
     """JSON formatter for structured logging.
@@ -516,6 +554,11 @@ class JsonFormatter(logging.Formatter):
             log_entry["exception"] = self.formatException(record.exc_info)
 
         return json.dumps(log_entry)
+
+
+def _parse_str_list(value: str) -> list[str]:
+    """Parse a comma-separated string into a non-empty list of stripped tokens."""
+    return [v.strip() for v in value.split(",") if v.strip()]
 
 
 def _validate_extraction_mode(mode: str) -> str:
@@ -562,6 +605,9 @@ class HindsightConfig:
     llm_vertexai_project_id: str | None
     llm_vertexai_region: str
     llm_vertexai_service_account_key: str | None
+
+    # Gemini safety settings (None = use Gemini defaults; list of dicts with category/threshold)
+    llm_gemini_safety_settings: list | None
 
     # Per-operation LLM configuration (None = use default LLM config)
     retain_llm_provider: str | None
@@ -660,6 +706,7 @@ class HindsightConfig:
     retain_batch_tokens: int
     retain_batch_enabled: bool
     retain_batch_poll_interval_seconds: int
+    retain_entity_lookup: str  # "full" or "trigram"
 
     # File storage (static - server-level only)
     file_storage_type: str  # "native" (PostgreSQL) or "s3" (S3-compatible)
@@ -673,7 +720,8 @@ class HindsightConfig:
     file_storage_azure_container: str | None  # Azure container name (required for azure storage)
     file_storage_azure_account_name: str | None  # Azure storage account name
     file_storage_azure_account_key: str | None  # Azure storage account key
-    file_parser: str  # File parser to use (e.g., "markitdown", "iris")
+    file_parser: list[str]  # Ordered fallback chain of parsers (e.g. ["iris", "markitdown"])
+    file_parser_allowlist: list[str] | None  # Parsers clients may request (None = all registered)
     file_parser_iris_token: str | None  # Vectorize API token for iris parser (VECTORIZE_TOKEN)
     file_parser_iris_org_id: str | None  # Vectorize org ID for iris parser (VECTORIZE_ORG_ID)
     file_conversion_max_batch_size_mb: int  # Max total batch size in MB (all files combined)
@@ -683,10 +731,21 @@ class HindsightConfig:
 
     # Observations settings (consolidated knowledge from facts)
     enable_observations: bool
+    enable_observation_history: bool
+    enable_mental_model_history: bool
     consolidation_batch_size: int
     consolidation_llm_batch_size: int
     consolidation_max_tokens: int
+    consolidation_source_facts_max_tokens: int
+    consolidation_source_facts_max_tokens_per_observation: int
     observations_mission: str | None
+
+    # Entity labels (controlled vocabulary of key:value classification labels extracted at retain time)
+    # List of label group dicts: [{key, description, type, optional, values: [{value, description}]}]
+    entity_labels: list | None
+    # Whether to extract regular named entities alongside entity labels (default: True)
+    # When False: only label entities are extracted (or no entities at all if no labels configured)
+    entities_allow_free_form: bool
 
     # Reflect agent settings
     reflect_mission: str | None
@@ -720,6 +779,7 @@ class HindsightConfig:
 
     # Reflect agent settings
     reflect_max_iterations: int
+    reflect_max_context_tokens: int
 
     # OpenTelemetry tracing configuration
     otel_traces_enabled: bool
@@ -727,6 +787,12 @@ class HindsightConfig:
     otel_exporter_otlp_headers: str | None
     otel_service_name: str
     otel_deployment_environment: str
+
+    # Webhook configuration (static - server-level only, not per-bank)
+    webhook_url: str | None  # Global webhook URL (None = disabled)
+    webhook_secret: str | None  # HMAC signing secret (None = unsigned)
+    webhook_event_types: list[str]  # Event types to deliver globally
+    webhook_delivery_poll_interval_seconds: int  # How often the delivery worker polls
 
     # Class-level sets for configuration categorization
 
@@ -767,8 +833,14 @@ class HindsightConfig:
         "retain_extraction_mode",
         "retain_mission",
         "retain_custom_instructions",
+        # Entity labels (controlled vocabulary for entity classification)
+        "entity_labels",
+        "entities_allow_free_form",
         # Consolidation settings
         "enable_observations",
+        "consolidation_llm_batch_size",
+        "consolidation_source_facts_max_tokens",
+        "consolidation_source_facts_max_tokens_per_observation",
         "observations_mission",
         # Reflect settings
         "reflect_mission",
@@ -776,6 +848,8 @@ class HindsightConfig:
         "disposition_skepticism",
         "disposition_literalism",
         "disposition_empathy",
+        # Gemini safety settings (controls content filtering for Gemini/VertexAI providers)
+        "llm_gemini_safety_settings",
     }
 
     @property
@@ -896,6 +970,8 @@ class HindsightConfig:
             llm_vertexai_region=os.getenv(ENV_LLM_VERTEXAI_REGION, DEFAULT_LLM_VERTEXAI_REGION),
             llm_vertexai_service_account_key=os.getenv(ENV_LLM_VERTEXAI_SERVICE_ACCOUNT_KEY)
             or DEFAULT_LLM_VERTEXAI_SERVICE_ACCOUNT_KEY,
+            # Gemini safety settings (JSON-encoded list of {category, threshold} dicts)
+            llm_gemini_safety_settings=json.loads(os.getenv(ENV_LLM_GEMINI_SAFETY_SETTINGS, "null")),
             # Per-operation LLM config (None = use default)
             retain_llm_provider=os.getenv(ENV_RETAIN_LLM_PROVIDER) or None,
             retain_llm_api_key=os.getenv(ENV_RETAIN_LLM_API_KEY) or None,
@@ -1071,6 +1147,7 @@ class HindsightConfig:
             retain_mission=os.getenv(ENV_RETAIN_MISSION) or DEFAULT_RETAIN_MISSION,
             retain_custom_instructions=os.getenv(ENV_RETAIN_CUSTOM_INSTRUCTIONS) or DEFAULT_RETAIN_CUSTOM_INSTRUCTIONS,
             retain_batch_tokens=int(os.getenv(ENV_RETAIN_BATCH_TOKENS, str(DEFAULT_RETAIN_BATCH_TOKENS))),
+            retain_entity_lookup=os.getenv(ENV_RETAIN_ENTITY_LOOKUP, DEFAULT_RETAIN_ENTITY_LOOKUP),
             retain_batch_enabled=os.getenv(ENV_RETAIN_BATCH_ENABLED, str(DEFAULT_RETAIN_BATCH_ENABLED)).lower()
             == "true",
             retain_batch_poll_interval_seconds=int(
@@ -1088,7 +1165,10 @@ class HindsightConfig:
             file_storage_azure_container=os.getenv(ENV_FILE_STORAGE_AZURE_CONTAINER) or None,
             file_storage_azure_account_name=os.getenv(ENV_FILE_STORAGE_AZURE_ACCOUNT_NAME) or None,
             file_storage_azure_account_key=os.getenv(ENV_FILE_STORAGE_AZURE_ACCOUNT_KEY) or None,
-            file_parser=os.getenv(ENV_FILE_PARSER, DEFAULT_FILE_PARSER),
+            file_parser=_parse_str_list(os.getenv(ENV_FILE_PARSER, DEFAULT_FILE_PARSER)),
+            file_parser_allowlist=_parse_str_list(os.getenv(ENV_FILE_PARSER_ALLOWLIST))
+            if os.getenv(ENV_FILE_PARSER_ALLOWLIST)
+            else None,
             file_parser_iris_token=os.getenv(ENV_FILE_PARSER_IRIS_TOKEN) or None,
             file_parser_iris_org_id=os.getenv(ENV_FILE_PARSER_IRIS_ORG_ID) or None,
             file_conversion_max_batch_size_mb=int(
@@ -1105,6 +1185,14 @@ class HindsightConfig:
             == "true",
             # Observations settings (consolidated knowledge from facts)
             enable_observations=os.getenv(ENV_ENABLE_OBSERVATIONS, str(DEFAULT_ENABLE_OBSERVATIONS)).lower() == "true",
+            enable_observation_history=os.getenv(
+                ENV_ENABLE_OBSERVATION_HISTORY, str(DEFAULT_ENABLE_OBSERVATION_HISTORY)
+            ).lower()
+            == "true",
+            enable_mental_model_history=os.getenv(
+                ENV_ENABLE_MENTAL_MODEL_HISTORY, str(DEFAULT_ENABLE_MENTAL_MODEL_HISTORY)
+            ).lower()
+            == "true",
             consolidation_batch_size=int(
                 os.getenv(ENV_CONSOLIDATION_BATCH_SIZE, str(DEFAULT_CONSOLIDATION_BATCH_SIZE))
             ),
@@ -1114,7 +1202,18 @@ class HindsightConfig:
             consolidation_max_tokens=int(
                 os.getenv(ENV_CONSOLIDATION_MAX_TOKENS, str(DEFAULT_CONSOLIDATION_MAX_TOKENS))
             ),
+            consolidation_source_facts_max_tokens=int(
+                os.getenv(ENV_CONSOLIDATION_SOURCE_FACTS_MAX_TOKENS, str(DEFAULT_CONSOLIDATION_SOURCE_FACTS_MAX_TOKENS))
+            ),
+            consolidation_source_facts_max_tokens_per_observation=int(
+                os.getenv(
+                    ENV_CONSOLIDATION_SOURCE_FACTS_MAX_TOKENS_PER_OBSERVATION,
+                    str(DEFAULT_CONSOLIDATION_SOURCE_FACTS_MAX_TOKENS_PER_OBSERVATION),
+                )
+            ),
             observations_mission=os.getenv(ENV_OBSERVATIONS_MISSION) or DEFAULT_OBSERVATIONS_MISSION,
+            entity_labels=None,
+            entities_allow_free_form=True,
             # Database migrations
             run_migrations_on_startup=os.getenv(ENV_RUN_MIGRATIONS_ON_STARTUP, "true").lower() == "true",
             # Database connection pool
@@ -1134,6 +1233,9 @@ class HindsightConfig:
             ),
             # Reflect agent settings
             reflect_max_iterations=int(os.getenv(ENV_REFLECT_MAX_ITERATIONS, str(DEFAULT_REFLECT_MAX_ITERATIONS))),
+            reflect_max_context_tokens=int(
+                os.getenv(ENV_REFLECT_MAX_CONTEXT_TOKENS, str(DEFAULT_REFLECT_MAX_CONTEXT_TOKENS))
+            ),
             reflect_mission=os.getenv(ENV_REFLECT_MISSION) or None,
             # Disposition settings (None = fall back to DB value)
             disposition_skepticism=int(os.getenv(ENV_DISPOSITION_SKEPTICISM))
@@ -1152,6 +1254,20 @@ class HindsightConfig:
             otel_exporter_otlp_headers=os.getenv(ENV_OTEL_EXPORTER_OTLP_HEADERS) or None,
             otel_service_name=os.getenv(ENV_OTEL_SERVICE_NAME, DEFAULT_OTEL_SERVICE_NAME),
             otel_deployment_environment=os.getenv(ENV_OTEL_DEPLOYMENT_ENVIRONMENT, DEFAULT_OTEL_DEPLOYMENT_ENVIRONMENT),
+            # Webhook configuration (static, server-level only)
+            webhook_url=os.getenv(ENV_WEBHOOK_URL) or DEFAULT_WEBHOOK_URL,
+            webhook_secret=os.getenv(ENV_WEBHOOK_SECRET) or DEFAULT_WEBHOOK_SECRET,
+            webhook_event_types=[
+                t.strip()
+                for t in os.getenv(ENV_WEBHOOK_EVENT_TYPES, DEFAULT_WEBHOOK_EVENT_TYPES).split(",")
+                if t.strip()
+            ],
+            webhook_delivery_poll_interval_seconds=int(
+                os.getenv(
+                    ENV_WEBHOOK_DELIVERY_POLL_INTERVAL_SECONDS,
+                    str(DEFAULT_WEBHOOK_DELIVERY_POLL_INTERVAL_SECONDS),
+                )
+            ),
         )
         config.validate()
         return config
